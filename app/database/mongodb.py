@@ -42,8 +42,14 @@ class MongoDBConnection:
             
             # Verify connection
             cls._client.admin.command("ping")
-            cls._db = cls._client.get_database()
-            logger.info("Successfully connected to MongoDB Atlas")
+            mongodb_db = os.getenv("MONGODB_DB")
+            if mongodb_db:
+                cls._db = cls._client[mongodb_db]
+            else:
+                cls._db = cls._client.get_database()
+            logger.info(
+                f"Successfully connected to MongoDB Atlas database={mongodb_db or cls._db.name}"
+            )
             
         except (ConnectionFailure, ServerSelectionTimeoutError) as e:
             logger.error(f"Failed to connect to MongoDB: {str(e)}")

@@ -9,10 +9,14 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from contextlib import asynccontextmanager
 import logging
 import os
+from dotenv import load_dotenv
 
 from app.routes.decision import router as decision_router
 from app.database.mongodb import MongoDBConnection
 from app.database.supabase import SupabaseConnection
+
+# Load environment variables from .env if available
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
