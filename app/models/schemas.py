@@ -4,7 +4,7 @@ Handles request/response validation and serialization.
 """
 
 from enum import Enum
-from typing import Optional
+from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -16,10 +16,16 @@ class RiskLevel(str, Enum):
 
 
 class RecommendedAction(str, Enum):
-    """Enumeration for recommended actions."""
+    """Enumeration for relief and response actions (rule-based suggestions)."""
     SAFE = "SAFE"
+    MONITOR = "MONITOR"
     PREPARE = "PREPARE"
+    PREPARE_ADDITIONAL_RESOURCES = "PREPARE ADDITIONAL RESOURCES"
+    PREPARE_FOOD_PACKS = "PREPARE FOOD PACKS"
+    PARTIAL_EVACUATION = "PARTIAL EVACUATION"
     IMMEDIATE_RELIEF = "IMMEDIATE RELIEF"
+    DEPLOY_RESCUE_TEAM = "DEPLOY RESCUE TEAM"
+    SEND_MEDICAL_ASSISTANCE = "SEND MEDICAL ASSISTANCE"
 
 
 # ============ Request Models ============
@@ -31,8 +37,13 @@ class DecisionRequest(BaseModel):
     
     Fields:
         barangay_id: Identifier for the barangay (community area)
+        override_action: Optional human-selected action (human-in-the-loop)
     """
     barangay_id: int = Field(..., description="Unique identifier for the barangay")
+    override_action: Optional[RecommendedAction] = Field(
+        default=None,
+        description="If set, this action becomes the official recommendation while AI suggestions remain advisory",
+    )
 
 
 # ============ Internal Models ============
@@ -101,6 +112,16 @@ class AHPOutput(BaseModel):
 # ============ Response Models ============
 
 
+class Suggestion(BaseModel):
+    """
+    A single ranked, explainable recommendation from the rule-based engine.
+    """
+    priority_rank: int = Field(..., ge=1, description="1 = most urgent after ranking")
+    action: RecommendedAction = Field(..., description="Suggested action")
+    confidence_score: float = Field(..., ge=0.0, le=1.0, description="Confidence in this suggestion (0-1)")
+    reason: str = Field(..., description="Rule-based rationale tied to risk, trend, and vulnerability")
+
+
 class DecisionResponse(BaseModel):
     """
     Response model for the decision endpoint.
@@ -116,10 +137,16 @@ class DecisionResponse(BaseModel):
         override_action: Optional human override of the recommendation
         fuzzy_explanation: Detailed explanation from fuzzy logic
         ahp_explanation: Detailed explanation from AHP calculation
+        suggestions: Ranked list of at least three explainable AI suggestions
     """
     barangay_id: int = Field(..., description="Barangay identifier")
     risk_level: RiskLevel = Field(..., description="Flood risk level")
     priority_score: float = Field(..., ge=0.0, le=1.0, description="Household priority score")
+    suggestions: List[Suggestion] = Field(
+        ...,
+        min_length=3,
+        description="At least three ranked suggestions (urgency, then confidence)",
+    )
     recommended_action: RecommendedAction = Field(..., description="Recommended action")
     confidence_score: float = Field(..., ge=0.0, le=1.0, description="Overall confidence score")
     explanation: str = Field(..., description="Summary explanation of the decision")
