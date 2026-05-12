@@ -219,6 +219,7 @@ class DecisionService:
         med_p = priority >= cls.MEDIUM_PRIORITY_THRESHOLD
         rising = trend == "rising"
         falling = trend == "falling"
+        stable = trend == "stable"
 
         raw: List[_RawSuggestion] = []
 

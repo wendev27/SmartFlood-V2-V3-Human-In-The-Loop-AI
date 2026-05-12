@@ -9,8 +9,10 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from contextlib import asynccontextmanager
 import logging
 import os
+import sys
 from dotenv import load_dotenv
 
+from app.models.schemas import HealthCheckResponse
 from app.routes.decision import router as decision_router
 from app.database.mongodb import MongoDBConnection
 from app.database.supabase import SupabaseConnection
@@ -34,6 +36,7 @@ async def lifespan(app: FastAPI):
     """
     # Startup
     logger.info("Starting up AI Decision Service...")
+    logger.info("Runtime Python %s", sys.version.split()[0])
     try:
         # Initialize database connections
         MongoDBConnection.connect()
@@ -65,8 +68,11 @@ app = FastAPI(
 )
 
 
-# Configure CORS - adjust origins for production
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000").split(",")
+# Configure CORS — comma-separated list; empty entries stripped (set via ALLOWED_ORIGINS on Render)
+_origins_raw = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000")
+ALLOWED_ORIGINS = [o.strip() for o in _origins_raw.split(",") if o.strip()]
+if not ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS = ["http://localhost:3000"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,26 +82,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Add security middleware for trusted hosts
-TRUSTED_HOSTS = os.getenv("TRUSTED_HOSTS", "localhost,127.0.0.1").split(",")
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=TRUSTED_HOSTS
-)
+# Trusted hosts — include *.onrender.com by default so production deploys are not rejected.
+# Set TRUSTED_HOSTS=* to disable host checking (local only).
+_env = os.getenv("ENV", "production")
+_default_trusted = "localhost,127.0.0.1,*.onrender.com"
+if _env == "development":
+    _default_trusted += ",testserver"
+_trusted_raw = os.getenv("TRUSTED_HOSTS", _default_trusted).strip()
+if _trusted_raw != "*":
+    TRUSTED_HOSTS = [h.strip() for h in _trusted_raw.split(",") if h.strip()]
+    if not TRUSTED_HOSTS:
+        TRUSTED_HOSTS = ["localhost", "127.0.0.1", "*.onrender.com"]
+    # Render sets RENDER=true; ensure the service hostname is accepted if .env omitted *.onrender.com
+    if os.getenv("RENDER") == "true" and "*.onrender.com" not in TRUSTED_HOSTS:
+        TRUSTED_HOSTS.append("*.onrender.com")
+    if _env == "development" and "testserver" not in TRUSTED_HOSTS:
+        TRUSTED_HOSTS.append("testserver")
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=TRUSTED_HOSTS
+    )
 
 
 # Add request logging middleware
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log all HTTP requests."""
-    logger.info(f"{request.method} {request.url.path}")
+    """Log requests at DEBUG to keep production logs readable (INFO for lifecycle and errors)."""
+    logger.debug("%s %s", request.method, request.url.path)
     response = await call_next(request)
-    logger.info(f"Status code: {response.status_code}")
+    logger.debug("status=%s path=%s", response.status_code, request.url.path)
     return response
 
 
 # Include routes
 app.include_router(decision_router, prefix="/api/v1", tags=["Decision"])
+
+
+@app.get("/health", response_model=HealthCheckResponse, tags=["Health"])
+async def health():
+    """
+    Liveness probe at the URL path most load balancers and docs expect.
+    Does not require MongoDB or Supabase so the service stays reachable during DB outages.
+    """
+    return HealthCheckResponse(
+        status="healthy",
+        message="AI Decision Service is running",
+    )
 
 
 # Root endpoint
