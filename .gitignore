@@ -72,9 +72,6 @@ Thumbs.db
 *.swo
 *~
 
-# Render
-render.yaml
-
 # Git
 .git/
 
