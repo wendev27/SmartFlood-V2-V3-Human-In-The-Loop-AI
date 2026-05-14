@@ -4,7 +4,8 @@ Handles request/response validation and serialization.
 """
 
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -26,6 +27,7 @@ class RecommendedAction(str, Enum):
     IMMEDIATE_RELIEF = "IMMEDIATE RELIEF"
     DEPLOY_RESCUE_TEAM = "DEPLOY RESCUE TEAM"
     SEND_MEDICAL_ASSISTANCE = "SEND MEDICAL ASSISTANCE"
+    FULL_EVACUATION = "FULL EVACUATION"
 
 
 # ============ Request Models ============
@@ -109,6 +111,40 @@ class AHPOutput(BaseModel):
     explanation: str = Field(..., description="Explanation of priority calculation")
 
 
+class FuzzyAssessmentDetail(BaseModel):
+    """Structured fuzzy output for API explainability."""
+    hazard_descriptor: str = Field(..., description="Official-style hazard label")
+    risk_level: RiskLevel = Field(..., description="Winning LOW/MEDIUM/HIGH class")
+    depth_avg_m: float = Field(..., description="Average depth in meters")
+    depth_max_m: float = Field(..., description="Peak depth in meters")
+    trend: str = Field(..., description="rising | falling | stable")
+    rainfall_intensity_mm: float = Field(..., ge=0.0, description="Rainfall intensity input (mm)")
+    confidence_score: float = Field(..., ge=0.0, le=1.0)
+    membership_scores: Dict[str, float] = Field(default_factory=dict)
+    reasoning_steps: List[str] = Field(default_factory=list)
+
+
+class AHPPriorityBreakdown(BaseModel):
+    """Transparent AHP-style breakdown returned to clients."""
+    priority_score: float = Field(..., ge=0.0, le=1.0)
+    weights_percent: Dict[str, float] = Field(default_factory=dict)
+    weighted_contributions: Dict[str, float] = Field(default_factory=dict)
+    sub_scores: Dict[str, float] = Field(default_factory=dict)
+    breakdown_lines: List[str] = Field(default_factory=list)
+    vulnerability_factors: List[str] = Field(default_factory=list)
+    factor_rationale: Dict[str, str] = Field(default_factory=dict)
+
+
+class ExplainabilityPayload(BaseModel):
+    """Cross-module explanations for human-in-the-loop review."""
+    why_flood_risk_classified: str = Field(..., description="Why fuzzy logic chose the hazard class")
+    why_barangay_priority: str = Field(..., description="Why the barangay vulnerability index is what it is")
+    top_recommendations_explained: List[str] = Field(
+        default_factory=list,
+        description="Per-suggestion drivers: hazard, trend, rainfall, vulnerability",
+    )
+
+
 # ============ Response Models ============
 
 
@@ -156,6 +192,18 @@ class DecisionResponse(BaseModel):
     )
     fuzzy_explanation: str = Field(..., description="Detailed fuzzy logic explanation")
     ahp_explanation: str = Field(..., description="Detailed AHP explanation")
+    fuzzy_assessment: Optional[FuzzyAssessmentDetail] = Field(
+        default=None,
+        description="Structured fuzzy outputs (memberships, reasoning steps, hazard label)",
+    )
+    ahp_breakdown: Optional[AHPPriorityBreakdown] = Field(
+        default=None,
+        description="Weights, sub-scores, and line-by-line AHP contribution audit",
+    )
+    explainability: Optional[ExplainabilityPayload] = Field(
+        default=None,
+        description="Narrative links between hazard, priority, and ranked recommendations",
+    )
 
 
 class HealthCheckResponse(BaseModel):

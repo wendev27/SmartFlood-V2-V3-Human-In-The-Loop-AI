@@ -89,19 +89,40 @@ class SupabaseConnection:
                     "infant_count": 0,
                     "pregnant_count": 0,
                     "pwd_count": 0,
+                    "four_ps_count": 0,
+                    "lactating_count": 0,
+                    "solo_parent_count": 0,
                     "total_residents": 0
                 }
             
+            def _truthy(row: Dict[str, Any], *keys: str) -> bool:
+                for k in keys:
+                    v = row.get(k)
+                    if v is True:
+                        return True
+                    if isinstance(v, (int, float)) and v != 0:
+                        return True
+                    if isinstance(v, str) and v.lower() in ("true", "1", "yes", "y"):
+                        return True
+                return False
+
             # Count vulnerability categories
             elderly_count = sum(1 for r in residents if r.get("age", 0) >= 60)
             infant_count = sum(1 for r in residents if r.get("age", 0) <= 2)
             pregnant_count = sum(1 for r in residents if r.get("is_pregnant", False))
             pwd_count = sum(1 for r in residents if r.get("is_pwd", False))
+            four_ps_count = sum(
+                1 for r in residents if _truthy(r, "is_4ps", "is_four_ps", "four_ps", "is_4ps_beneficiary")
+            )
+            lactating_count = sum(1 for r in residents if _truthy(r, "is_lactating", "lactating"))
+            solo_parent_count = sum(1 for r in residents if _truthy(r, "is_solo_parent", "solo_parent"))
             
             logger.info(
                 f"Retrieved vulnerability data for barangay {barangay_id}: "
                 f"elderly={elderly_count}, infants={infant_count}, "
-                f"pregnant={pregnant_count}, pwd={pwd_count}, total={len(residents)}"
+                f"pregnant={pregnant_count}, pwd={pwd_count}, "
+                f"4ps={four_ps_count}, lactating={lactating_count}, solo_parent={solo_parent_count}, "
+                f"total={len(residents)}"
             )
             
             return {
@@ -110,6 +131,9 @@ class SupabaseConnection:
                 "infant_count": infant_count,
                 "pregnant_count": pregnant_count,
                 "pwd_count": pwd_count,
+                "four_ps_count": four_ps_count,
+                "lactating_count": lactating_count,
+                "solo_parent_count": solo_parent_count,
                 "total_residents": len(residents)
             }
             
