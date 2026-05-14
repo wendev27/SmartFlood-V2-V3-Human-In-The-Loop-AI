@@ -106,6 +106,7 @@ class DecisionService:
                 avg_water_level=sensor_data["avg_water_level"],
                 max_water_level=sensor_data["max_water_level"],
                 trend=sensor_data["trend"],
+                rainfall_intensity_mm=float(sensor_data.get("rainfall_intensity_mm") or 0.0),
             )
 
             household_data = SupabaseConnection.get_household_vulnerability(barangay_id)
@@ -115,6 +116,9 @@ class DecisionService:
                 infant_count=household_data["infant_count"],
                 pregnant_count=household_data["pregnant_count"],
                 pwd_count=household_data["pwd_count"],
+                four_ps_count=household_data.get("four_ps_count", 0),
+                lactating_count=household_data.get("lactating_count", 0),
+                solo_parent_count=household_data.get("solo_parent_count", 0),
                 total_residents=household_data.get("total_residents", 5),
             )
 
@@ -128,6 +132,12 @@ class DecisionService:
                 ahp_result=ahp_result,
                 override_action=override_action,
                 ranked_suggestions=suggestions,
+            )
+
+            fuzzy_assessment = cls._fuzzy_assessment_payload(fuzzy_result)
+            ahp_breakdown = cls._ahp_breakdown_payload(ahp_result)
+            explainability = cls._explainability_payload(
+                fuzzy_result, ahp_result, suggestions
             )
 
             logger.info(
@@ -147,10 +157,14 @@ class DecisionService:
                 "override_action": override_action,
                 "fuzzy_explanation": fuzzy_result["explanation"],
                 "ahp_explanation": ahp_result["explanation"],
+                "fuzzy_assessment": fuzzy_assessment,
+                "ahp_breakdown": ahp_breakdown,
+                "explainability": explainability,
                 "_metadata": {
                     "sensor_readings_count": sensor_data.get("readings_count", 0),
                     "total_residents": household_data.get("total_residents", 0),
                     "vulnerability_factors": ahp_result.get("vulnerability_factors", []),
+                    "rainfall_intensity_mm": sensor_data.get("rainfall_intensity_mm", 0.0),
                 },
             }
 
@@ -171,6 +185,9 @@ class DecisionService:
                 "override_action": override_action,
                 "fuzzy_explanation": "Error retrieving sensor data",
                 "ahp_explanation": "Error retrieving household data",
+                "fuzzy_assessment": None,
+                "ahp_breakdown": None,
+                "explainability": None,
                 "_metadata": {"error": str(e)},
             }
 
@@ -199,6 +216,69 @@ class DecisionService:
         ]
 
     @classmethod
+    def _fuzzy_assessment_payload(cls, fuzzy_result: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "hazard_descriptor": fuzzy_result.get("hazard_descriptor", ""),
+            "risk_level": fuzzy_result["risk_level"],
+            "depth_avg_m": float(fuzzy_result.get("depth_avg_m", 0.0)),
+            "depth_max_m": float(fuzzy_result.get("depth_max_m", 0.0)),
+            "trend": str(fuzzy_result.get("trend", "stable")),
+            "rainfall_intensity_mm": float(fuzzy_result.get("rainfall_intensity_mm", 0.0)),
+            "confidence_score": float(fuzzy_result.get("confidence_score", 0.0)),
+            "membership_scores": dict(fuzzy_result.get("membership_scores") or {}),
+            "reasoning_steps": list(fuzzy_result.get("reasoning_steps") or []),
+        }
+
+    @classmethod
+    def _ahp_breakdown_payload(cls, ahp: Dict[str, Any]) -> Dict[str, Any]:
+        subs = {k: float(v) for k, v in (ahp.get("sub_scores") or {}).items()}
+        return {
+            "priority_score": float(ahp.get("priority_score", 0.0)),
+            "weights_percent": dict(ahp.get("weights_percent") or {}),
+            "weighted_contributions": dict(ahp.get("weighted_contributions") or {}),
+            "sub_scores": subs,
+            "breakdown_lines": list(ahp.get("breakdown_lines") or []),
+            "vulnerability_factors": list(ahp.get("vulnerability_factors") or []),
+            "factor_rationale": dict(ahp.get("factor_rationale") or {}),
+        }
+
+    @classmethod
+    def _explainability_payload(
+        cls,
+        fuzzy_result: Dict[str, Any],
+        ahp_result: Dict[str, Any],
+        suggestions: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        risk = cls._risk_str(fuzzy_result)
+        trend = str(fuzzy_result.get("trend", "stable"))
+        rain = float(fuzzy_result.get("rainfall_intensity_mm") or 0.0)
+        depth = float(fuzzy_result.get("depth_avg_m") or 0.0)
+        pr = float(ahp_result.get("priority_score", 0.0))
+        memberships = fuzzy_result.get("membership_scores") or {}
+        steps = fuzzy_result.get("reasoning_steps") or []
+        why_flood = (
+            f"Hazard label «{fuzzy_result.get('hazard_descriptor', '')}» corresponds to fuzzy class {risk} "
+            f"with average depth {depth:.2f} m, trend {trend}, rainfall {rain:.1f} mm, "
+            f"and posterior weights {memberships}. "
+            f"Key reasoning: {' | '.join(steps[:5])}"
+        )
+        lines = ahp_result.get("breakdown_lines") or []
+        why_priority = f"{ahp_result.get('explanation', '')} Contribution audit: {'; '.join(lines[:5])}."
+        top_explained: List[str] = []
+        for s in suggestions[:5]:
+            act = s["action"]
+            av = act.value if hasattr(act, "value") else str(act)
+            top_explained.append(
+                f"Rank {s['priority_rank']} — {av}: {s.get('reason', '')}. "
+                f"Drivers: hazard={risk}, trend={trend}, rain={rain:.1f} mm, vulnerability_index={pr:.2f}."
+            )
+        return {
+            "why_flood_risk_classified": why_flood,
+            "why_barangay_priority": why_priority,
+            "top_recommendations_explained": top_explained,
+        }
+
+    @classmethod
     def _risk_str(cls, fuzzy_result: Dict[str, Any]) -> str:
         rl = fuzzy_result["risk_level"]
         return rl.value if isinstance(rl, RiskLevel) else str(rl)
@@ -214,26 +294,73 @@ class DecisionService:
         trend = str(fuzzy_result.get("trend", "stable")).lower()
         risk_conf = float(fuzzy_result["confidence_score"])
         priority = float(ahp_result["priority_score"])
+        depth_m = float(fuzzy_result.get("depth_avg_m", 0.0))
+        rain_mm = float(fuzzy_result.get("rainfall_intensity_mm", 0.0))
+        design = FuzzyLogicService.DESIGN_RAINFALL_MM
+        rain_ratio = rain_mm / design if design > 0 else 0.0
+        rain_heavy = rain_ratio >= 0.72
+        catastrophic_depth = depth_m >= 1.65
 
         high_p = priority >= cls.HIGH_PRIORITY_THRESHOLD
         med_p = priority >= cls.MEDIUM_PRIORITY_THRESHOLD
         rising = trend == "rising"
         falling = trend == "falling"
-        stable = trend == "stable"
 
         raw: List[_RawSuggestion] = []
 
         def conf(base: float) -> float:
             return max(0.0, min(1.0, base))
 
-        # --- Immediate / rescue / medical (high urgency) ---
+        # --- Full evacuation (catastrophic hydrology + demographics) ---
+        if risk == "HIGH" and rising and high_p and (catastrophic_depth or rain_heavy):
+            raw.append(
+                _RawSuggestion(
+                    RecommendedAction.FULL_EVACUATION,
+                    (
+                        "Depth near or above official HIGH band with rising trend and concentrated "
+                        "vulnerability; intense rainfall vs IDF design further stresses drainage — "
+                        "area-wide evacuation is the realistic protective action"
+                    ),
+                    109.0,
+                    conf(min(0.97, risk_conf + 0.14 * (0.5 + rain_ratio))),
+                )
+            )
+        elif risk == "HIGH" and rising and med_p and catastrophic_depth:
+            raw.append(
+                _RawSuggestion(
+                    RecommendedAction.FULL_EVACUATION,
+                    (
+                        "Very deep flood stage with rising hydrograph; even moderate demographic "
+                        "vulnerability cannot be mitigated in place — coordinate full evacuation corridors"
+                    ),
+                    104.0,
+                    conf(risk_conf * 0.93 + priority * 0.05),
+                )
+            )
+
+        # --- Immediate relief / rescue / medical ---
         if risk == "HIGH" and high_p:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.IMMEDIATE_RELIEF,
-                    "High flood levels and highly vulnerable households",
+                    (
+                        "HIGH hazard class with high vulnerability index — life-safety relief "
+                        "(water, food, medical) must be treated as immediate"
+                    ),
                     100.0,
                     conf(min(0.95, risk_conf + 0.12)),
+                )
+            )
+        elif risk == "MEDIUM" and high_p and (rising or rain_heavy):
+            raw.append(
+                _RawSuggestion(
+                    RecommendedAction.IMMEDIATE_RELIEF,
+                    (
+                        "MEDIUM hazard with vulnerable residents and either rising water or rainfall "
+                        "approaching design IDF — relief lead times are shrinking"
+                    ),
+                    93.0,
+                    conf(risk_conf * 0.90 + priority * 0.08 + (0.04 if rain_heavy else 0.0)),
                 )
             )
         elif risk == "MEDIUM" and high_p:
@@ -241,7 +368,7 @@ class DecisionService:
                 _RawSuggestion(
                     RecommendedAction.IMMEDIATE_RELIEF,
                     "Elevated flood risk with high household vulnerability warrants urgent relief",
-                    92.0,
+                    90.0,
                     conf(risk_conf * 0.92 + priority * 0.08),
                 )
             )
@@ -250,9 +377,12 @@ class DecisionService:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.DEPLOY_RESCUE_TEAM,
-                    "High classified flood risk requires rescue capacity on standby or deployed",
-                    86.0,
-                    conf(risk_conf * 0.88 + (0.05 if rising else 0.0)),
+                    (
+                        "HIGH hazard requires rescue capacity staged or deployed; "
+                        f"trend={trend}, rainfall ratio vs design={rain_ratio:.2f}"
+                    ),
+                    87.0,
+                    conf(risk_conf * 0.88 + (0.06 if rising else 0.0) + (0.04 if rain_heavy else 0.0)),
                 )
             )
 
@@ -260,8 +390,11 @@ class DecisionService:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.SEND_MEDICAL_ASSISTANCE,
-                    "Vulnerable household composition elevates medical support priority",
-                    78.0,
+                    (
+                        "Vulnerable household mix (infants, elderly, PWD, pregnancy, lactation, "
+                        "solo parents, 4Ps) raises medical support priority alongside flood stress"
+                    ),
+                    79.0,
                     conf(0.72 * risk_conf + 0.28 * priority),
                 )
             )
@@ -270,9 +403,9 @@ class DecisionService:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.PARTIAL_EVACUATION,
-                    "Flood trend is rapidly rising; staged evacuation reduces exposure",
-                    84.0 if risk == "HIGH" else 72.0,
-                    conf(risk_conf * 0.85 + (0.1 if rising else 0.0)),
+                    "Rising hydrograph — staged/partial evacuation reduces exposure before depth peaks",
+                    85.0 if risk == "HIGH" else 73.0,
+                    conf(risk_conf * 0.85 + 0.08 * (1.0 if rising else 0.0)),
                 )
             )
 
@@ -280,19 +413,37 @@ class DecisionService:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.PREPARE_FOOD_PACKS,
-                    "High water risk with moderate vulnerability; pre-stage food distribution",
-                    68.0,
-                    conf(risk_conf * 0.82 + priority * 0.1),
+                    (
+                        "HIGH hazard with moderate vulnerability — pre-position food packs for "
+                        "shelters and in-place assistance until transport clears"
+                    ),
+                    70.0,
+                    conf(risk_conf * 0.82 + priority * 0.1 + (0.03 if rain_heavy else 0.0)),
+                )
+            )
+        elif risk == "MEDIUM" and (med_p or rain_heavy):
+            raw.append(
+                _RawSuggestion(
+                    RecommendedAction.PREPARE_FOOD_PACKS,
+                    (
+                        "MEDIUM hazard with hydrologic or demographic stress — stage food packs for "
+                        "likely distribution within the event window"
+                    ),
+                    58.0,
+                    conf(0.55 * risk_conf + 0.25 * priority + (0.15 if rain_heavy else 0.0)),
                 )
             )
 
-        if risk in ("HIGH", "MEDIUM") and (rising or (risk == "HIGH" and stable)):
+        if risk in ("HIGH", "MEDIUM") and (rising or (risk == "HIGH" and stable) or rain_heavy):
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.PREPARE_ADDITIONAL_RESOURCES,
-                    "Potential escalation within the next monitoring window given level and trend",
-                    66.0 if rising else 58.0,
-                    conf(risk_conf * 0.78 + (0.08 if rising else -0.05)),
+                    (
+                        "Escalation risk from hazard class, trend, or rainfall vs IDF reference — "
+                        "pre-stage logistics (boats, trucks, fuel)"
+                    ),
+                    66.0 if rising or rain_heavy else 58.0,
+                    conf(risk_conf * 0.78 + (0.08 if rising else 0.0) + (0.06 if rain_heavy else -0.05)),
                 )
             )
 
@@ -300,17 +451,23 @@ class DecisionService:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.PREPARE,
-                    "Medium flood risk with moderate vulnerability; readiness and routing checks",
+                    (
+                        "MEDIUM hazard with moderate vulnerability — verify routes, shelters, "
+                        "and roster vulnerable households before stronger actions"
+                    ),
                     56.0,
                     conf((risk_conf + priority) / 2 * 0.88),
                 )
             )
 
-        if risk == "MEDIUM" and not med_p:
+        if risk == "MEDIUM" and not med_p and not rain_heavy:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.MONITOR,
-                    "Medium environmental risk with lower demographic vulnerability; intensify monitoring",
+                    (
+                        "MEDIUM hazard with lower vulnerability index and rainfall below heavy IDF "
+                        "fraction — intensify monitoring and field verification"
+                    ),
                     48.0,
                     conf(risk_conf * 0.8),
                 )
@@ -320,7 +477,10 @@ class DecisionService:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.PREPARE,
-                    "Water levels are low but vulnerable residents warrant contingency preparation",
+                    (
+                        "Hydrology in SAFE/LOW band but registry shows concentrated vulnerability — "
+                        "keep contingency kits and transport on standby"
+                    ),
                     44.0,
                     conf(risk_conf * 0.75 + priority * 0.15),
                 )
@@ -330,16 +490,19 @@ class DecisionService:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.SAFE,
-                    "Low flood risk and limited vulnerability indicators at this assessment",
-                    35.0,
+                    (
+                        "SAFE/LOW hazard with limited vulnerability signals — routine readiness only; "
+                        "human confirmation still required before standing down"
+                    ),
+                    36.0,
                     conf(risk_conf * 0.88),
                 )
             )
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.MONITOR,
-                    "Maintain routine monitoring despite favorable flood signals",
-                    30.0,
+                    "Maintain routine monitoring; hydrology can change quickly under new rainfall",
+                    31.0,
                     conf(0.55 + (0.05 if falling else 0.0)),
                 )
             )
@@ -348,9 +511,12 @@ class DecisionService:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.PREPARE,
-                    "High water risk with lower recorded demographic vulnerability; still pre-position assets",
-                    62.0,
-                    conf(risk_conf * 0.84),
+                    (
+                        "HIGH water class with lower recorded demographic vulnerability — "
+                        "still pre-position assets; depth alone justifies operational readiness"
+                    ),
+                    63.0,
+                    conf(risk_conf * 0.84 + (0.04 if rain_heavy else 0.0)),
                 )
             )
 
@@ -493,9 +659,20 @@ class DecisionService:
             f"Risk level {risk_level} combined with {priority_level} ({priority_pct}%)"
         ]
 
-        if action == RecommendedAction.IMMEDIATE_RELIEF:
+        if action == RecommendedAction.FULL_EVACUATION:
+            parts.append(
+                f"supports coordinated full evacuation as the top rule-based action "
+                f"(confidence: {confidence_pct}%) because hazard, trend, and/or rainfall crossed "
+                f"catastrophic staging thresholds with elevated vulnerability."
+            )
+        elif action == RecommendedAction.IMMEDIATE_RELIEF:
             parts.append(
                 f"indicates immediate relief is the leading recommendation (confidence: {confidence_pct}%)."
+            )
+        elif action == RecommendedAction.PREPARE_FOOD_PACKS:
+            parts.append(
+                f"indicates food-pack staging and distribution readiness lead the response mix "
+                f"(confidence: {confidence_pct}%)."
             )
         elif action in (RecommendedAction.PREPARE, RecommendedAction.PREPARE_ADDITIONAL_RESOURCES):
             parts.append(

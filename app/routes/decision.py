@@ -4,7 +4,15 @@ Handles HTTP requests and responses.
 """
 
 from fastapi import APIRouter, HTTPException, status
-from app.models.schemas import DecisionRequest, DecisionResponse, HealthCheckResponse, Suggestion
+from app.models.schemas import (
+    AHPPriorityBreakdown,
+    DecisionRequest,
+    DecisionResponse,
+    ExplainabilityPayload,
+    FuzzyAssessmentDetail,
+    HealthCheckResponse,
+    Suggestion,
+)
 from app.services.decision_service import DecisionService
 import logging
 
@@ -77,6 +85,10 @@ async def get_decision(request: DecisionRequest) -> DecisionResponse:
 
         suggestions = [Suggestion(**s) for s in decision["suggestions"]]
 
+        fa = decision.get("fuzzy_assessment")
+        ab = decision.get("ahp_breakdown")
+        ex = decision.get("explainability")
+
         response = DecisionResponse(
             barangay_id=decision["barangay_id"],
             risk_level=decision["risk_level"],
@@ -88,6 +100,9 @@ async def get_decision(request: DecisionRequest) -> DecisionResponse:
             override_action=decision["override_action"],
             fuzzy_explanation=decision["fuzzy_explanation"],
             ahp_explanation=decision["ahp_explanation"],
+            fuzzy_assessment=FuzzyAssessmentDetail(**fa) if fa else None,
+            ahp_breakdown=AHPPriorityBreakdown(**ab) if ab else None,
+            explainability=ExplainabilityPayload(**ex) if ex else None,
         )
         
         logger.info(

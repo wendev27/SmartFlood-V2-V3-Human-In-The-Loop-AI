@@ -87,6 +87,7 @@ class MongoDBConnection:
                 - avg_water_level: Average water level in cm
                 - max_water_level: Maximum water level in cm
                 - trend: "rising", "falling", or "stable"
+                - rainfall_intensity_mm: Mean rainfall intensity (mm) when readings include a rainfall field; else 0.0
                 - timestamp: Latest reading timestamp
                 - readings_count: Number of readings aggregated
         """
@@ -108,12 +109,28 @@ class MongoDBConnection:
                     "avg_water_level": 0.0,
                     "max_water_level": 0.0,
                     "trend": "stable",
+                    "rainfall_intensity_mm": 0.0,
                     "timestamp": datetime.utcnow().isoformat(),
                     "readings_count": 0
                 }
-            
+
+            def _rain_mm(doc: Dict[str, Any]) -> float:
+                for key in (
+                    "rainfall_intensity_mm",
+                    "rainfall_mm",
+                    "rain_mm",
+                    "rainfall_intensity",
+                ):
+                    if key in doc and doc[key] is not None:
+                        try:
+                            return max(0.0, float(doc[key]))
+                        except (TypeError, ValueError):
+                            continue
+                return 0.0
+
             # Extract water levels
             water_levels = [float(r.get("water_level", 0)) for r in readings]
+            rainfall_samples = [_rain_mm(r) for r in readings]
             
             # Calculate aggregate metrics
             avg_water_level = sum(water_levels) / len(water_levels)
@@ -138,12 +155,17 @@ class MongoDBConnection:
             
             latest_timestamp = readings[-1].get("timestamp", datetime.utcnow())
             
+            rainfall_intensity_mm = (
+                sum(rainfall_samples) / len(rainfall_samples) if rainfall_samples else 0.0
+            )
+
             logger.info(f"Retrieved {len(water_levels)} sensor readings for barangay {barangay_id}")
             
             return {
                 "avg_water_level": avg_water_level,
                 "max_water_level": max_water_level,
                 "trend": trend,
+                "rainfall_intensity_mm": rainfall_intensity_mm,
                 "timestamp": latest_timestamp.isoformat() if hasattr(latest_timestamp, 'isoformat') else str(latest_timestamp),
                 "readings_count": len(water_levels)
             }

@@ -1,120 +1,151 @@
 """
-AHP (Analytic Hierarchy Process) service for household vulnerability assessment.
-Evaluates vulnerability based on demographics and special needs.
+AHP-style vulnerability scoring for SmartFlood relief prioritization.
+
+Seven factors (weights sum to 100%, deterministic, explainable — no ML):
+PWD, Infant, Elderly, Pregnant, 4Ps beneficiary, Lactating mother, Solo parent.
+
+Each factor has a documented rationale tied to evacuation difficulty, health risk,
+or socioeconomic stress during floods.
 """
 
-from typing import Dict, Any
+from __future__ import annotations
+
 import logging
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
 
 class AHPService:
     """
-    Implements AHP for household vulnerability scoring.
-    
-    AHP combines multiple vulnerability factors with weighted scores:
-    - Elderly residents (60+): High vulnerability
-    - Infants (0-2): Very high vulnerability
-    - Pregnant residents: Medium vulnerability
-    - PWD residents: High vulnerability
-    
-    Weights reflect evacuation difficulty and medical needs.
-    Final score is normalized to 0-1 range.
+    Weighted vulnerability model (transparent linear aggregation).
+    Factor scores are in [0, 1]; priority_score = sum(weight_i * score_i) in [0, 1].
     """
-    
-    # AHP weights for each vulnerability factor
-    # These are normalized so they sum to 1.0
-    WEIGHTS = {
-        "elderly": 0.35,      # High priority - mobility issues, medical needs
-        "infant": 0.40,       # Highest priority - complete dependence
-        "pregnant": 0.15,     # Medium priority - medical monitoring needed
-        "pwd": 0.10           # Priority based on severity (here general weight)
+
+    # Weights sum to 1.0 (100 %)
+    WEIGHTS: Dict[str, float] = {
+        "infant": 0.22,
+        "elderly": 0.20,
+        "pwd": 0.18,
+        "pregnant": 0.12,
+        "lactating": 0.10,
+        "solo_parent": 0.10,
+        "four_ps": 0.08,
     }
-    
-    # Normalize factor: How much each person in a category contributes to priority
-    # Adjusted based on typical household sizes (~5 people)
+
+    FACTOR_RATIONALE: Dict[str, str] = {
+        "infant": (
+            "Infants cannot self-evacuate, are sensitive to hypothermia/contamination, "
+            "and need caregivers — flood exposure sharply increases morbidity risk."
+        ),
+        "elderly": (
+            "Older adults often have reduced mobility, chronic illness, and slower reaction time, "
+            "making wading, climbing, and shelter transitions hazardous."
+        ),
+        "pwd": (
+            "Persons with disabilities may rely on assistive devices, accessible routes, or carers; "
+            "flood debris and uneven footing raise injury and entrapment risk."
+        ),
+        "pregnant": (
+            "Pregnancy increases physical strain during movement, needs continuity of antenatal care, "
+            "and complications can escalate without timely medical access."
+        ),
+        "lactating": (
+            "Lactating mothers need nutrition, hydration, and privacy for infant feeding; "
+            "displacement disrupts breastfeeding and infant energy intake."
+        ),
+        "solo_parent": (
+            "Solo parents simultaneously supervise children and carry belongings; "
+            "single-caregiver households bottleneck evacuation and queueing."
+        ),
+        "four_ps": (
+            "4Ps households often have tighter budgets and fewer transport assets, "
+            "delaying self-evacuation and increasing dependence on relief logistics."
+        ),
+    }
+
     NORMALIZATION_BASE = 5
-    
+
     @classmethod
-    def calculate_priority(cls, elderly_count: int, infant_count: int,
-                          pregnant_count: int, pwd_count: int,
-                          total_residents: int = 0) -> Dict[str, Any]:
-        """
-        Calculate household vulnerability priority score using AHP.
-        
-        Args:
-            elderly_count: Number of elderly residents (age >= 60)
-            infant_count: Number of infants (age <= 2)
-            pregnant_count: Number of pregnant residents
-            pwd_count: Number of PWD residents
-            total_residents: Total number of residents (for normalization)
-        
-        Returns:
-            Dictionary with:
-                - priority_score: Final normalized score (0-1)
-                - sub_scores: Individual scores for each factor
-                - explanation: Human-readable explanation
-                - vulnerability_factors: List of active vulnerability factors
-        """
-        
-        # Ensure non-negative counts
-        elderly_count = max(0, elderly_count)
-        infant_count = max(0, infant_count)
-        pregnant_count = max(0, pregnant_count)
-        pwd_count = max(0, pwd_count)
-        
-        if total_residents == 0:
-            total_residents = elderly_count + infant_count + pregnant_count + pwd_count + 1
-        
-        # Calculate raw scores for each vulnerability factor
-        elderly_score = cls._calculate_factor_score(elderly_count, total_residents, "elderly")
-        infant_score = cls._calculate_factor_score(infant_count, total_residents, "infant")
-        pregnant_score = cls._calculate_factor_score(pregnant_count, total_residents, "pregnant")
-        pwd_score = cls._calculate_factor_score(pwd_count, total_residents, "pwd")
-        
-        # Combine using AHP weights (weighted sum)
-        combined_score = (
-            elderly_score * cls.WEIGHTS["elderly"] +
-            infant_score * cls.WEIGHTS["infant"] +
-            pregnant_score * cls.WEIGHTS["pregnant"] +
-            pwd_score * cls.WEIGHTS["pwd"]
+    def calculate_priority(
+        cls,
+        elderly_count: int = 0,
+        infant_count: int = 0,
+        pregnant_count: int = 0,
+        pwd_count: int = 0,
+        four_ps_count: int = 0,
+        lactating_count: int = 0,
+        solo_parent_count: int = 0,
+        total_residents: int = 0,
+    ) -> Dict[str, Any]:
+        elderly_count = max(0, int(elderly_count))
+        infant_count = max(0, int(infant_count))
+        pregnant_count = max(0, int(pregnant_count))
+        pwd_count = max(0, int(pwd_count))
+        four_ps_count = max(0, int(four_ps_count))
+        lactating_count = max(0, int(lactating_count))
+        solo_parent_count = max(0, int(solo_parent_count))
+
+        if total_residents <= 0:
+            total_residents = max(
+                1,
+                elderly_count
+                + infant_count
+                + pregnant_count
+                + pwd_count
+                + four_ps_count
+                + lactating_count
+                + solo_parent_count,
+            )
+
+        scores = {
+            "elderly": cls._calculate_factor_score(elderly_count, total_residents, "elderly"),
+            "infant": cls._calculate_factor_score(infant_count, total_residents, "infant"),
+            "pregnant": cls._calculate_factor_score(pregnant_count, total_residents, "pregnant"),
+            "pwd": cls._calculate_factor_score(pwd_count, total_residents, "pwd"),
+            "four_ps": cls._calculate_factor_score(four_ps_count, total_residents, "four_ps"),
+            "lactating": cls._calculate_factor_score(lactating_count, total_residents, "lactating"),
+            "solo_parent": cls._calculate_factor_score(solo_parent_count, total_residents, "solo_parent"),
+        }
+
+        weighted = {k: round(scores[k] * cls.WEIGHTS[k], 6) for k in cls.WEIGHTS}
+        priority_score = round(sum(weighted.values()), 6)
+        priority_score = max(0.0, min(1.0, priority_score))
+
+        vulnerability_factors = cls._format_factors(
+            elderly_count,
+            infant_count,
+            pregnant_count,
+            pwd_count,
+            four_ps_count,
+            lactating_count,
+            solo_parent_count,
         )
-        
-        # Normalize to 0-1 range and apply non-linear scaling
-        # This ensures that households with vulnerable members get higher priority
-        priority_score = cls._normalize_score(combined_score)
-        
-        # Identify which vulnerability factors are present
-        vulnerability_factors = []
-        if elderly_count > 0:
-            vulnerability_factors.append(f"Elderly ({elderly_count})")
-        if infant_count > 0:
-            vulnerability_factors.append(f"Infants ({infant_count})")
-        if pregnant_count > 0:
-            vulnerability_factors.append(f"Pregnant ({pregnant_count})")
-        if pwd_count > 0:
-            vulnerability_factors.append(f"PWD ({pwd_count})")
-        
-        # Generate explanation
+
+        weights_percent = {k: round(v * 100.0, 2) for k, v in cls.WEIGHTS.items()}
+
         explanation = cls._generate_explanation(
-            elderly_count, infant_count, pregnant_count, pwd_count,
-            priority_score, vulnerability_factors
+            priority_score,
+            vulnerability_factors,
+            weighted,
+            scores,
         )
-        
+
+        breakdown_lines = cls._breakdown_lines(scores, weighted, weights_percent)
+
         logger.info(
-            f"AHP Priority Score: {priority_score:.3f} - "
-            f"Factors: {', '.join(vulnerability_factors) if vulnerability_factors else 'None'}"
+            "AHP priority=%.3f factors=%s",
+            priority_score,
+            vulnerability_factors or ["none"],
         )
-        
+
         return {
             "priority_score": priority_score,
-            "sub_scores": {
-                "elderly_score": elderly_score,
-                "infant_score": infant_score,
-                "pregnant_score": pregnant_score,
-                "pwd_score": pwd_score
-            },
+            "sub_scores": {f"{k}_score": scores[k] for k in scores},
+            "weighted_contributions": weighted,
+            "weights_percent": weights_percent,
+            "factor_rationale": dict(cls.FACTOR_RATIONALE),
+            "breakdown_lines": breakdown_lines,
             "explanation": explanation,
             "vulnerability_factors": vulnerability_factors,
             "household_composition": {
@@ -122,133 +153,108 @@ class AHPService:
                 "infant": infant_count,
                 "pregnant": pregnant_count,
                 "pwd": pwd_count,
-                "total_residents": total_residents
-            }
+                "four_ps": four_ps_count,
+                "lactating": lactating_count,
+                "solo_parent": solo_parent_count,
+                "total_residents": total_residents,
+            },
         }
-    
+
+    @staticmethod
+    def _format_factors(
+        elderly: int,
+        infant: int,
+        pregnant: int,
+        pwd: int,
+        four_ps: int,
+        lactating: int,
+        solo_parent: int,
+    ) -> List[str]:
+        out: List[str] = []
+        if pwd:
+            out.append(f"PWD ({pwd})")
+        if infant:
+            out.append(f"Infant ({infant})")
+        if elderly:
+            out.append(f"Elderly ({elderly})")
+        if pregnant:
+            out.append(f"Pregnant ({pregnant})")
+        if four_ps:
+            out.append(f"4Ps beneficiary ({four_ps})")
+        if lactating:
+            out.append(f"Lactating mother ({lactating})")
+        if solo_parent:
+            out.append(f"Solo parent ({solo_parent})")
+        return out
+
     @classmethod
     def _calculate_factor_score(cls, count: int, total_residents: int, factor_type: str) -> float:
-        """
-        Calculate score for a specific vulnerability factor.
-        Score increases with count, normalized by household size.
-        
-        Args:
-            count: Number of people in this vulnerability category
-            total_residents: Total residents in household
-            factor_type: Type of vulnerability (elderly, infant, pregnant, pwd)
-        
-        Returns:
-            Score for this factor (0-1, unbounded in calculation)
-        """
-        
-        if total_residents == 0:
+        if total_residents <= 0:
             return 0.0
-        
-        # Proportion of household in this category
-        proportion = count / total_residents
-        
-        # Apply factor-specific scoring
-        # Infants and elderly get higher scores for same proportion
-        if factor_type == "infant":
-            # Infants are very vulnerable - high impact even in small numbers
-            factor_score = min(1.0, proportion * 3.0)
-        elif factor_type == "elderly":
-            # Elderly are highly vulnerable
-            factor_score = min(1.0, proportion * 2.5)
-        elif factor_type == "pregnant":
-            # Pregnant people need care but less critical than infants/elderly
-            factor_score = min(1.0, proportion * 1.5)
-        elif factor_type == "pwd":
-            # PWD impact depends on severity (general weight here)
-            factor_score = min(1.0, proportion * 1.2)
-        else:
-            factor_score = proportion
-        
-        return factor_score
-    
+        proportion = min(1.0, count / float(total_residents))
+
+        # Bounded marginal impact per category (deterministic)
+        multipliers = {
+            "infant": 3.0,
+            "elderly": 2.5,
+            "pwd": 2.4,
+            "pregnant": 1.6,
+            "lactating": 1.7,
+            "solo_parent": 1.8,
+            "four_ps": 1.5,
+        }
+        m = multipliers.get(factor_type, 1.5)
+        return max(0.0, min(1.0, proportion * m))
+
     @classmethod
-    def _normalize_score(cls, combined_score: float) -> float:
-        """
-        Normalize combined score to 0-1 range using sigmoid-like function.
-        This ensures scores are proportional but not unbounded.
-        
-        Args:
-            combined_score: Raw combined score from weighted factors
-        
-        Returns:
-            Normalized priority score (0-1)
-        """
-        
-        # Sigmoid-like normalization: helps compress extreme values
-        # while preserving relative ordering
-        # Formula: 1 / (1 + e^(-x*2))
-        # This maps [-inf, inf] -> [0, 1] with steepness at 0
-        
-        # For practical purposes, cap the input to avoid numerical issues
-        x = min(3.0, max(-3.0, combined_score * 2.0))
-        
-        # Approximate sigmoid using simpler formula
-        # For reasonable inputs, this gives values in [0, 1]
-        if x > 2.0:
-            priority_score = 0.95
-        elif x < -2.0:
-            priority_score = 0.05
-        else:
-            # Polynomial approximation of sigmoid
-            priority_score = 0.5 + (x / 5.0) + (x**3 / 20.0)
-            priority_score = max(0.0, min(1.0, priority_score))
-        
-        return priority_score
-    
+    def _breakdown_lines(
+        cls,
+        scores: Dict[str, float],
+        weighted: Dict[str, float],
+        weights_percent: Dict[str, float],
+    ) -> List[str]:
+        lines = []
+        for key in cls.WEIGHTS:
+            pct = weights_percent[key]
+            lines.append(
+                f"{key}: weight {pct:.2f}% × factor {scores[key]:.3f} "
+                f"→ contribution {weighted[key]:.4f} — {cls.FACTOR_RATIONALE[key]}"
+            )
+        return lines
+
     @classmethod
-    def _generate_explanation(cls, elderly_count: int, infant_count: int,
-                             pregnant_count: int, pwd_count: int,
-                             priority_score: float, vulnerability_factors: list) -> str:
-        """
-        Generate a human-readable explanation of the priority score.
-        
-        Args:
-            elderly_count: Number of elderly residents
-            infant_count: Number of infants
-            pregnant_count: Number of pregnant residents
-            pwd_count: Number of PWD residents
-            priority_score: Final priority score
-            vulnerability_factors: List of vulnerability factors
-        
-        Returns:
-            Human-readable explanation
-        """
-        
-        priority_pct = int(priority_score * 100)
-        
-        parts = []
-        parts.append(f"Household Vulnerability Assessment: {priority_pct}% priority")
-        
+    def _generate_explanation(
+        cls,
+        priority_score: float,
+        vulnerability_factors: List[str],
+        weighted: Dict[str, float],
+        scores: Dict[str, float],
+    ) -> str:
+        pct = int(round(priority_score * 100))
+        parts = [
+            f"Household / barangay vulnerability index: {pct}/100 (transparent weighted sum).",
+        ]
         if not vulnerability_factors:
-            parts.append("No identified vulnerability factors.")
+            parts.append("No tagged vulnerability factors in the registry for this query.")
         else:
-            parts.append(f"Vulnerable members: {', '.join(vulnerability_factors)}.")
-        
-        # Priority level classification
+            parts.append(f"Tagged vulnerable members: {', '.join(vulnerability_factors)}.")
+        top = sorted(weighted.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        if top and top[0][1] > 0:
+            parts.append(
+                "Largest weighted drivers: "
+                + ", ".join(f"{k} ({v:.3f})" for k, v in top if v > 0)
+                + "."
+            )
         if priority_score < 0.2:
-            priority_level = "Low"
+            lvl = "low relief priority"
         elif priority_score < 0.4:
-            priority_level = "Moderate"
-        elif priority_score < 0.7:
-            priority_level = "High"
+            lvl = "moderate relief priority"
+        elif priority_score < 0.65:
+            lvl = "high relief priority"
         else:
-            priority_level = "Critical"
-        
-        parts.append(f"Priority level: {priority_level}")
-        
-        # Specific guidance
-        if infant_count > 0:
-            parts.append(f"Household has {infant_count} infant(s) requiring special evacuation support.")
-        if elderly_count > 0:
-            parts.append(f"Household has {elderly_count} elderly resident(s) who may need mobility assistance.")
-        if pregnant_count > 0:
-            parts.append(f"Household has {pregnant_count} pregnant resident(s) needing medical monitoring.")
-        if pwd_count > 0:
-            parts.append(f"Household has {pwd_count} resident(s) with disabilities requiring accommodations.")
-        
+            lvl = "very high relief priority"
+        parts.append(f"Relief band: {lvl}.")
         return " ".join(parts)
+
+
+__all__ = ["AHPService"]
