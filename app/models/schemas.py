@@ -210,3 +210,33 @@ class HealthCheckResponse(BaseModel):
     """Health check response model."""
     status: str = Field(..., description="Service status")
     message: str = Field(..., description="Status message")
+
+
+class CityWideDetailedReasoning(BaseModel):
+    """Detailed reasoning components for a city-wide analysis item."""
+    flood_analysis: str
+    vulnerability_analysis: str
+    contributing_factors: List[str]
+    recommendation_reasoning: List[str]
+    ahp_breakdown: Optional[AHPPriorityBreakdown] = None
+    fuzzy_assessment: Optional[FuzzyAssessmentDetail] = None
+
+
+class CityWideAnalysisItem(BaseModel):
+    """
+    A single barangay's analysis result for the city-wide dashboard.
+    """
+    barangay_id: int
+    barangay_name: str
+    risk_level: RiskLevel
+    confidence_score: float
+    recommended_items: List[str]
+    short_reason: str
+    detailed_reasoning: CityWideDetailedReasoning
+
+
+class CityWideAnalysisResponse(BaseModel):
+    """
+    City-wide analysis response containing all barangays.
+    """
+    city_analysis: List[CityWideAnalysisItem]
