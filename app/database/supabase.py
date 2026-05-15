@@ -140,3 +140,45 @@ class SupabaseConnection:
         except Exception as e:
             logger.error(f"Error fetching household vulnerability data: {str(e)}")
             raise
+
+    @classmethod
+    def get_all_barangays(cls) -> List[Dict[str, Any]]:
+        """
+        Fetch all barangays. Tries the `barangays` table first, then falls back
+        to collecting distinct barangay_ids from `residents`.
+        
+        Returns:
+            List of dictionaries containing at least 'id' and 'name'.
+        """
+        client = cls.get_client()
+        
+        try:
+            # Try fetching from a 'barangays' table
+            try:
+                response = client.table("barangays").select("id, name").execute()
+                if response.data:
+                    return response.data
+            except Exception as inner_e:
+                logger.warning(f"Could not fetch from 'barangays' table, falling back to residents: {inner_e}")
+
+            # Fallback: get distinct from residents
+            logger.info("Falling back to distinct barangay_ids from residents table")
+            response = client.table("residents").select("barangay_id").execute()
+            if not response.data:
+                return []
+            
+            unique_ids = set()
+            barangays = []
+            for r in response.data:
+                bid = r.get("barangay_id")
+                if bid is not None and bid not in unique_ids:
+                    unique_ids.add(bid)
+                    barangays.append({
+                        "id": bid,
+                        "name": f"Barangay {bid}"
+                    })
+            return barangays
+
+        except Exception as e:
+            logger.error(f"Error fetching all barangays: {str(e)}")
+            return []

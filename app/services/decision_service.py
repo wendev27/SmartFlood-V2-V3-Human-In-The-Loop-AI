@@ -689,3 +689,78 @@ class DecisionService:
 
         parts.append(f"Official recommendation (rank 1): {action.value}")
         return " ".join(parts)
+
+    @classmethod
+    def make_city_wide_decision(cls) -> List[Dict[str, Any]]:
+        """
+        Evaluate all barangays and return a ranked list of priorities.
+        """
+        logger.info("Making city-wide decision")
+        
+        barangays = SupabaseConnection.get_all_barangays()
+        if not barangays:
+            logger.warning("No barangays found for city-wide analysis.")
+            return []
+
+        analysis_results = []
+        for bg in barangays:
+            bg_id = bg.get("id")
+            if bg_id is None:
+                continue
+                
+            try:
+                bg_id_int = int(bg_id)
+                decision = cls.make_decision(barangay_id=bg_id_int)
+                
+                # Format into CityWideAnalysisItem dict
+                explain = decision.get("explainability", {}) or {}
+                
+                # Map risk level string/enum to RiskLevel enum values
+                raw_risk = decision.get("risk_level", RiskLevel.MEDIUM)
+                risk_str = raw_risk.value if hasattr(raw_risk, "value") else str(raw_risk)
+                
+                item = {
+                    "barangay_id": bg_id_int,
+                    "barangay_name": bg.get("name", f"Barangay {bg_id_int}"),
+                    "risk_level": risk_str,
+                    "confidence_score": decision.get("confidence_score", 0.0),
+                    "recommended_items": [s.get("action").value if hasattr(s.get("action"), "value") else str(s.get("action")) for s in decision.get("suggestions", [])],
+                    "short_reason": decision.get("explanation", ""),
+                    "detailed_reasoning": {
+                        "flood_analysis": explain.get("why_flood_risk_classified", ""),
+                        "vulnerability_analysis": explain.get("why_barangay_priority", ""),
+                        "contributing_factors": decision.get("_metadata", {}).get("vulnerability_factors", []),
+                        "recommendation_reasoning": explain.get("top_recommendations_explained", []),
+                        "ahp_breakdown": decision.get("ahp_breakdown"),
+                        "fuzzy_assessment": decision.get("fuzzy_assessment")
+                    },
+                    # We also temporarily store priority_score for sorting
+                    "_priority_score": decision.get("priority_score", 0.0)
+                }
+                analysis_results.append(item)
+            except Exception as e:
+                logger.error(f"Error processing barangay {bg_id} for city-wide analysis: {e}")
+                
+        # Sort by: HIGH risk first, then confidence score, then vulnerability (priority_score)
+        def sort_key(item):
+            risk = item["risk_level"]
+            if risk == "HIGH":
+                risk_val = 3
+            elif risk == "MEDIUM":
+                risk_val = 2
+            else:
+                risk_val = 1
+                
+            return (
+                risk_val,
+                item["confidence_score"],
+                item["_priority_score"]
+            )
+            
+        analysis_results.sort(key=sort_key, reverse=True)
+        
+        # Remove the temporary sort key
+        for item in analysis_results:
+            item.pop("_priority_score", None)
+            
+        return analysis_results

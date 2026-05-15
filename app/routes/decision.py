@@ -12,6 +12,7 @@ from app.models.schemas import (
     FuzzyAssessmentDetail,
     HealthCheckResponse,
     Suggestion,
+    CityWideAnalysisResponse,
 )
 from app.services.decision_service import DecisionService
 import logging
@@ -120,3 +121,27 @@ async def get_decision(request: DecisionRequest) -> DecisionResponse:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error. Service temporarily unavailable."
         )
+
+
+@router.post(
+    "/decision/city-wide",
+    response_model=CityWideAnalysisResponse,
+    summary="Get City-Wide Decision Analysis",
+    description="Automatically evaluates ALL barangays using fuzzy+AHP decision pipeline and returns ranked priorities.",
+    status_code=status.HTTP_200_OK
+)
+async def get_city_wide_decision() -> CityWideAnalysisResponse:
+    """
+    Get city-wide disaster prioritization.
+    """
+    logger.info("Processing city-wide decision request")
+    
+    try:
+        analysis_results = DecisionService.make_city_wide_decision()
+        response = CityWideAnalysisResponse(city_analysis=analysis_results)
+        logger.info(f"City-wide decision request completed: {len(analysis_results)} barangays analyzed")
+        return response
+    except Exception as e:
+        logger.error(f"Unexpected error processing city-wide decision request: {str(e)}", exc_info=True)
+        # Even on top-level error, we return empty array instead of crashing as requested
+        return CityWideAnalysisResponse(city_analysis=[])
