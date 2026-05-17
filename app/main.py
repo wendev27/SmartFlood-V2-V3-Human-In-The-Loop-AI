@@ -69,7 +69,7 @@ app = FastAPI(
 
 
 # Configure CORS — comma-separated list; empty entries stripped (set via ALLOWED_ORIGINS on Render)
-_origins_raw = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000")
+_origins_raw = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000,https://malabon-smartflood.vercel.app")
 ALLOWED_ORIGINS = [o.strip() for o in _origins_raw.split(",") if o.strip()]
 if not ALLOWED_ORIGINS:
     ALLOWED_ORIGINS = ["http://localhost:3000"]
