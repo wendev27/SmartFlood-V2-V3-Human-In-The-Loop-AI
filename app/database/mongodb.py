@@ -4,8 +4,8 @@ Handles connections to MongoDB Atlas and sensor data retrieval.
 """
 
 import os
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any, List
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 import logging
@@ -71,6 +71,103 @@ class MongoDBConnection:
         if cls._db is None:
             cls.connect()
         return cls._db
+
+    @classmethod
+    def _empty_sensor_fallback(cls) -> Dict[str, Any]:
+        """Safe defaults when MongoDB is unavailable or has no recent readings."""
+        return {
+            "avg_water_level": 0.0,
+            "max_water_level": 0.0,
+            "trend": "stable",
+            "rainfall_intensity_mm": 0.0,
+            "timestamp": datetime.utcnow().isoformat(),
+            "readings_count": 0,
+        }
+
+    @classmethod
+    def _reading_time(cls, doc: Dict[str, Any]) -> Optional[datetime]:
+        """Parse timestamp from Malabon sensor documents (recorded_at or timestamp)."""
+        raw = doc.get("recorded_at") or doc.get("timestamp")
+        if raw is None:
+            return None
+        if isinstance(raw, datetime):
+            return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+        if isinstance(raw, str):
+            text = raw.replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(text)
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _water_level_cm(cls, doc: Dict[str, Any]) -> float:
+        for key in ("water_level_cm", "water_level", "waterLevel"):
+            if key in doc and doc[key] is not None:
+                try:
+                    return max(0.0, float(doc[key]))
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
+    @classmethod
+    def _rain_mm(cls, doc: Dict[str, Any]) -> float:
+        for key in (
+            "rainfall_intensity_mm",
+            "rainfall_mm",
+            "rainfall",
+            "rain_mm",
+            "rainfall_intensity",
+        ):
+            if key in doc and doc[key] is not None:
+                try:
+                    return max(0.0, float(doc[key]))
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
+    @classmethod
+    def _aggregate_readings(cls, readings: List[Dict[str, Any]], barangay_id: int) -> Dict[str, Any]:
+        water_levels = [cls._water_level_cm(r) for r in readings]
+        rainfall_samples = [cls._rain_mm(r) for r in readings]
+
+        avg_water_level = sum(water_levels) / len(water_levels)
+        max_water_level = max(water_levels)
+
+        mid_point = len(water_levels) // 2
+        if mid_point > 0:
+            first_half_avg = sum(water_levels[:mid_point]) / mid_point
+            second_half_avg = sum(water_levels[mid_point:]) / len(water_levels[mid_point:])
+            threshold = first_half_avg * 0.02
+            if second_half_avg > first_half_avg + threshold:
+                trend = "rising"
+            elif second_half_avg < first_half_avg - threshold:
+                trend = "falling"
+            else:
+                trend = "stable"
+        else:
+            trend = "stable"
+
+        latest_timestamp = cls._reading_time(readings[-1]) or datetime.now(timezone.utc)
+        rainfall_intensity_mm = (
+            sum(rainfall_samples) / len(rainfall_samples) if rainfall_samples else 0.0
+        )
+
+        logger.info(
+            "Retrieved %s sensor readings for barangay %s",
+            len(water_levels),
+            barangay_id,
+        )
+
+        return {
+            "avg_water_level": avg_water_level,
+            "max_water_level": max_water_level,
+            "trend": trend,
+            "rainfall_intensity_mm": rainfall_intensity_mm,
+            "timestamp": latest_timestamp.isoformat(),
+            "readings_count": len(water_levels),
+        }
     
     @classmethod
     def get_sensor_data(cls, barangay_id: int, minutes: int = 10) -> Dict[str, Any]:
@@ -91,85 +188,52 @@ class MongoDBConnection:
                 - timestamp: Latest reading timestamp
                 - readings_count: Number of readings aggregated
         """
-        db = cls.get_db()
+        try:
+            db = cls.get_db()
+        except Exception as e:
+            logger.warning(
+                "MongoDB unavailable for barangay %s, using sensor fallback: %s",
+                barangay_id,
+                e,
+            )
+            return cls._empty_sensor_fallback()
         
         try:
-            # Query for recent sensor readings
-            cutoff_time = datetime.utcnow() - timedelta(minutes=minutes)
-            
             collection = db.get_collection("sensor_readings")
-            readings = list(collection.find({
-                "barangay_id": barangay_id,
-                "timestamp": {"$gte": cutoff_time}
-            }).sort("timestamp", 1))
-            
+            cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+
+            all_for_barangay = list(
+                collection.find({"barangay_id": barangay_id}).sort("recorded_at", 1)
+            )
+            if not all_for_barangay:
+                all_for_barangay = list(
+                    collection.find({"barangay_id": barangay_id}).sort("timestamp", 1)
+                )
+
+            readings = [
+                doc
+                for doc in all_for_barangay
+                if (t := cls._reading_time(doc)) is not None and t >= cutoff_time
+            ]
+
+            if not readings and all_for_barangay:
+                logger.info(
+                    "No sensor data in last %s minutes for barangay %s; using latest stored readings",
+                    minutes,
+                    barangay_id,
+                )
+                readings = all_for_barangay[-10:]
+
             if not readings:
                 logger.warning(f"No sensor data found for barangay {barangay_id}")
-                return {
-                    "avg_water_level": 0.0,
-                    "max_water_level": 0.0,
-                    "trend": "stable",
-                    "rainfall_intensity_mm": 0.0,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "readings_count": 0
-                }
+                return cls._empty_sensor_fallback()
 
-            def _rain_mm(doc: Dict[str, Any]) -> float:
-                for key in (
-                    "rainfall_intensity_mm",
-                    "rainfall_mm",
-                    "rain_mm",
-                    "rainfall_intensity",
-                ):
-                    if key in doc and doc[key] is not None:
-                        try:
-                            return max(0.0, float(doc[key]))
-                        except (TypeError, ValueError):
-                            continue
-                return 0.0
-
-            # Extract water levels
-            water_levels = [float(r.get("water_level", 0)) for r in readings]
-            rainfall_samples = [_rain_mm(r) for r in readings]
-            
-            # Calculate aggregate metrics
-            avg_water_level = sum(water_levels) / len(water_levels)
-            max_water_level = max(water_levels)
-            
-            # Determine trend (compare first half vs second half)
-            mid_point = len(water_levels) // 2
-            if mid_point > 0:
-                first_half_avg = sum(water_levels[:mid_point]) / mid_point
-                second_half_avg = sum(water_levels[mid_point:]) / len(water_levels[mid_point:])
-                
-                # Allow 2% tolerance for "stable"
-                threshold = first_half_avg * 0.02
-                if second_half_avg > first_half_avg + threshold:
-                    trend = "rising"
-                elif second_half_avg < first_half_avg - threshold:
-                    trend = "falling"
-                else:
-                    trend = "stable"
-            else:
-                trend = "stable"
-            
-            latest_timestamp = readings[-1].get("timestamp", datetime.utcnow())
-            
-            rainfall_intensity_mm = (
-                sum(rainfall_samples) / len(rainfall_samples) if rainfall_samples else 0.0
-            )
-
-            logger.info(f"Retrieved {len(water_levels)} sensor readings for barangay {barangay_id}")
-            
-            return {
-                "avg_water_level": avg_water_level,
-                "max_water_level": max_water_level,
-                "trend": trend,
-                "rainfall_intensity_mm": rainfall_intensity_mm,
-                "timestamp": latest_timestamp.isoformat() if hasattr(latest_timestamp, 'isoformat') else str(latest_timestamp),
-                "readings_count": len(water_levels)
-            }
+            return cls._aggregate_readings(readings, barangay_id)
             
         except Exception as e:
-            logger.error(f"Error fetching sensor data: {str(e)}")
-            raise
+            logger.warning(
+                "Error fetching sensor data for barangay %s, using fallback: %s",
+                barangay_id,
+                e,
+            )
+            return cls._empty_sensor_fallback()
