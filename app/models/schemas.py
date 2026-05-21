@@ -31,6 +31,14 @@ class RecommendedAction(str, Enum):
     FULL_EVACUATION = "FULL EVACUATION"
 
 
+class RecommendationStatus(str, Enum):
+    """Enumeration for the status of the recommendation."""
+    STABLE = "stable"
+    MONITORING = "monitoring"
+    CRITICAL = "critical"
+    RESOURCE_SHORTAGE = "resource_shortage"
+
+
 # ============ Request Models ============
 
 
@@ -146,6 +154,29 @@ class ExplainabilityPayload(BaseModel):
     )
 
 
+class RecommendedItem(BaseModel):
+    """Specific relief item recommendation."""
+    item: str = Field(..., description="Name of the recommended item")
+    quantity: str = Field(..., description="Quantity of the item (can be int or string with units)")
+    reason: str = Field(..., description="Operational reason for recommending this item")
+
+
+class InventoryConstraint(BaseModel):
+    """Details about an inventory shortage constraint."""
+    item: str = Field(..., description="Name of the constrained item")
+    requested: int = Field(..., description="Originally requested amount")
+    allocated: int = Field(..., description="Actual allocated amount due to shortage")
+    shortage_reason: str = Field(..., description="Explanation of the shortage")
+
+
+class SensorReliability(BaseModel):
+    """Metadata regarding the reliability of the sensor array."""
+    active_sensors: int = Field(default=0, description="Number of active sensors")
+    offline_sensors: int = Field(default=0, description="Number of offline sensors")
+    degraded_sensors: int = Field(default=0, description="Number of degraded sensors")
+    reliability_score: int = Field(default=0, description="0-100 reliability score")
+
+
 # ============ Response Models ============
 
 
@@ -205,6 +236,22 @@ class DecisionResponse(BaseModel):
         default=None,
         description="Narrative links between hazard, priority, and ranked recommendations",
     )
+    
+    # New Operational Fields
+    priority_level: str = Field(..., description="Multi-factor operational priority level")
+    analysis_confidence: int = Field(..., description="0-100 scaled analysis confidence")
+    affected_families: int = Field(..., description="Estimated affected families")
+    affected_population: int = Field(..., description="Total affected population")
+    estimated_evacuation_population: int = Field(..., description="Estimated population needing evacuation")
+    recommended_items: List[RecommendedItem] = Field(default_factory=list, description="Specific relief item recommendations")
+    analysis_reason: List[str] = Field(default_factory=list, description="List of specific operational reasons")
+    operational_urgency_score: int = Field(..., description="0-100 operational urgency score")
+    recommendation_status: RecommendationStatus = Field(..., description="Status of the recommendation")
+    inventory_constraints: List[InventoryConstraint] = Field(default_factory=list, description="Any inventory shortage constraints applied")
+    adjusted_recommendations: bool = Field(default=False, description="True if recommendations were reduced due to inventory shortages")
+    recommendation_source: List[str] = Field(default_factory=list, description="Sources involved in the recommendation generation")
+    operational_notes: List[str] = Field(default_factory=list, description="Additional operational observations")
+    sensor_reliability: Optional[SensorReliability] = Field(default=None, description="Metadata regarding sensor array health")
 
 
 class HealthCheckResponse(BaseModel):

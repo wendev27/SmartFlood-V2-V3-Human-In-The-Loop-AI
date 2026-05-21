@@ -104,6 +104,20 @@ async def get_decision(request: DecisionRequest) -> DecisionResponse:
             fuzzy_assessment=FuzzyAssessmentDetail(**fa) if fa else None,
             ahp_breakdown=AHPPriorityBreakdown(**ab) if ab else None,
             explainability=ExplainabilityPayload(**ex) if ex else None,
+            priority_level=decision.get("priority_level", "MEDIUM"),
+            analysis_confidence=decision.get("analysis_confidence", 0),
+            affected_families=decision.get("affected_families", 0),
+            affected_population=decision.get("affected_population", 0),
+            estimated_evacuation_population=decision.get("estimated_evacuation_population", 0),
+            recommended_items=decision.get("recommended_items", []),
+            analysis_reason=decision.get("analysis_reason", []),
+            operational_urgency_score=decision.get("operational_urgency_score", 0),
+            recommendation_status=decision.get("recommendation_status", "stable"),
+            inventory_constraints=decision.get("inventory_constraints", []),
+            adjusted_recommendations=decision.get("adjusted_recommendations", False),
+            recommendation_source=decision.get("recommendation_source", []),
+            operational_notes=decision.get("operational_notes", []),
+            sensor_reliability=decision.get("sensor_reliability")
         )
         
         logger.info(
