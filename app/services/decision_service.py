@@ -15,6 +15,7 @@ from app.database.supabase import SupabaseConnection
 from app.models.schemas import RecommendedAction, RiskLevel
 from app.services.ahp_service import AHPService
 from app.services.fuzzy_service import FuzzyLogicService
+from app.services.resource_recommendation_service import ResourceRecommendationService
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,14 @@ class DecisionService:
             explainability = cls._explainability_payload(
                 fuzzy_result, ahp_result, suggestions
             )
+            
+            # New Operational Logistics Engine
+            operational_outputs = ResourceRecommendationService.generate_recommendations(
+                fuzzy_result=fuzzy_result,
+                ahp_result=ahp_result,
+                household_data=household_data,
+                sensor_data=sensor_data,
+            )
 
             logger.info(
                 f"Decision made for barangay {barangay_id}: "
@@ -166,6 +175,7 @@ class DecisionService:
                     "vulnerability_factors": ahp_result.get("vulnerability_factors", []),
                     "rainfall_intensity_mm": sensor_data.get("rainfall_intensity_mm", 0.0),
                 },
+                **operational_outputs
             }
 
         except Exception as e:
@@ -189,6 +199,21 @@ class DecisionService:
                 "ahp_breakdown": None,
                 "explainability": None,
                 "_metadata": {"error": str(e)},
+                # Fallback operational fields
+                "priority_level": "MEDIUM",
+                "analysis_confidence": 30,
+                "affected_families": 0,
+                "affected_population": 0,
+                "estimated_evacuation_population": 0,
+                "recommended_items": [],
+                "analysis_reason": [f"System error: {str(e)[:50]}..."],
+                "operational_urgency_score": 50,
+                "recommendation_status": "monitoring",
+                "inventory_constraints": [],
+                "adjusted_recommendations": False,
+                "recommendation_source": ["error_fallback"],
+                "operational_notes": ["System degraded. Operating in fallback mode."],
+                "sensor_reliability": None
             }
 
     @classmethod
