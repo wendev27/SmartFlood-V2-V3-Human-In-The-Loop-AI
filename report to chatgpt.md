@@ -180,7 +180,7 @@ Legacy string fields **`fuzzy_explanation`** and **`ahp_explanation`** remain fo
 | Signal | Effect |
 |--------|--------|
 | **Hazard class** (LOW / MEDIUM / HIGH) | Sets the baseline action tier (safe/monitor vs prepare vs rescue/evacuation). |
-| **Trend** | Rising unlocks stronger evacuation and faster relief; falling dampens fuzzy HIGH mass. |
+| **Trend** | Rising unlocks stronfinal-working-allowed-origin-vercelger evacuation and faster relief; falling dampens fuzzy HIGH mass. |
 | **Rainfall vs 243.1 mm** | Heavy rain strengthens MEDIUM/HIGH memberships and raises urgency of food packs, resources, and evacuation rules. |
 | **Vulnerability index** | Gates **IMMEDIATE RELIEF**, **MEDICAL**, **FULL EVACUATION** conjunctions; high index prioritizes in-place assistance when hydrology is borderline. |
 

@@ -1,23 +1,19 @@
 """
 Fuzzy Logic service for SmartFlood flood risk assessment (rule-based, explainable).
 
-Engineering context (calibration):
-- IDF design rainfall reference: 243.100 mm (used to scale rainfall intensity input).
-- Annual exceedance for 5-year return period: 20% (1/5) — documented for transparency.
-
-Hazard bands (flood depth, meters), aligned with official SmartFlood levels:
-- Below 0.1 m: no advisory flood depth exceeded — treated as SAFE / LOW classification.
-- LOW HAZARD (YELLOW): 0.1 m – 0.5 m
-- MEDIUM HAZARD (ORANGE): 0.5 m – 1.5 m
-- HIGH HAZARD (RED): above 1.5 m
-
-Sensor inputs remain in centimeters for MongoDB compatibility (converted internally to meters).
+Official calibration (project manager):
+- Flood depth in MongoDB: water_level_cm (centimeters); internal hazard bands use meters.
+- LOW HAZARD (YELLOW): 10–50 cm (0.10–0.50 m)
+- MEDIUM HAZARD (ORANGE): 51–150 cm (0.51–1.50 m)
+- HIGH HAZARD (RED): > 150 cm (> 1.50 m)
+- Rainfall IDF design reference: 243.100 mm
+- Rainfall contribution: 0–50 mm LOW, 51–150 mm MODERATE, > 150 mm SEVERE
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from app.models.schemas import RiskLevel
 
@@ -26,24 +22,35 @@ logger = logging.getLogger(__name__)
 
 class FuzzyLogicService:
     """
-    Trapezoidal / piecewise-linear fuzzy memberships over water depth (m),
-    fused with trend and rainfall intensity, with explainable reasoning.
+    Official SmartFlood hazard bands with fuzzy boundary softening,
+    rainfall severity fusion, and explainable reasoning steps.
     """
 
-    # --- Flood engineering reference (documentation + rainfall scaling) ---
     DESIGN_RAINFALL_MM = 243.100
     RETURN_PERIOD_YEARS = 5
-    ANNUAL_EXCEEDANCE_PROBABILITY = 0.20  # 1/5 per year for 5-year RP (communicated to operators)
+    ANNUAL_EXCEEDANCE_PROBABILITY = 0.20
 
-    # Official hazard depth bands (meters)
-    HAZARD_LOW_MIN_M = 0.1
-    HAZARD_LOW_MAX_M = 0.5
-    HAZARD_MED_MIN_M = 0.5
-    HAZARD_MED_MAX_M = 1.5
-    HAZARD_HIGH_ABOVE_M = 1.5
+    # Depth bands (centimeters) — official thresholds
+    SAFE_MAX_CM = 10.0
+    LOW_MIN_CM = 10.0
+    LOW_MAX_CM = 50.0
+    MED_MIN_CM = 51.0
+    MED_MAX_CM = 150.0
+    HIGH_ABOVE_CM = 150.0
 
-    # Historical / advisory “no flood stage” upper bound (m) — below this, never classify HIGH from depth alone
-    SAFE_DEPTH_CEILING_M = 0.10
+    # Depth bands (meters) — derived for documentation / reasoning
+    HAZARD_LOW_MIN_M = LOW_MIN_CM / 100.0
+    HAZARD_LOW_MAX_M = LOW_MAX_CM / 100.0
+    HAZARD_MED_MIN_M = MED_MIN_CM / 100.0
+    HAZARD_MED_MAX_M = MED_MAX_CM / 100.0
+    HAZARD_HIGH_ABOVE_M = HIGH_ABOVE_CM / 100.0
+    SAFE_DEPTH_CEILING_M = SAFE_MAX_CM / 100.0
+
+    # Rainfall severity bands (mm)
+    RAIN_LOW_MAX_MM = 50.0
+    RAIN_MODERATE_MAX_MM = 150.0
+
+    _RISK_ORDER: Tuple[str, ...] = ("LOW", "MEDIUM", "HIGH", "CRITICAL")
 
     @classmethod
     def assess_risk(
@@ -54,17 +61,13 @@ class FuzzyLogicService:
         rainfall_intensity_mm: float | None = None,
     ) -> Dict[str, Any]:
         """
-        Assess flood risk using fuzzy memberships (LOW / MEDIUM / HIGH).
+        Assess flood risk using official depth + rainfall criteria.
 
         Args:
             avg_water_level: Average water level in cm
             max_water_level: Maximum water level in cm (recent window)
             trend: rising | falling | stable
-            rainfall_intensity_mm: Recent rainfall intensity (mm); optional — if missing, treated as 0.0
-
-        Returns:
-            Dict including risk_level (RiskLevel), confidence_score, hazard_descriptor,
-            membership_scores, reasoning_steps, and engineering_notes.
+            rainfall_intensity_mm: Recent rainfall intensity (mm); optional
         """
         avg_water_level = max(0.0, float(avg_water_level))
         max_water_level = max(0.0, float(max_water_level))
@@ -76,41 +79,54 @@ class FuzzyLogicService:
 
         d_avg_m = cls._cm_to_m(avg_water_level)
         d_max_m = cls._cm_to_m(max_water_level)
+        peak_cm = max(avg_water_level, max_water_level)
 
-        mu_avg = cls._base_memberships_depth(d_avg_m)
-        mu_max = cls._base_memberships_depth(d_max_m)
-        # Peak-aware fusion (fuzzy OR): recent spikes cannot be ignored, but 0 m spike with 0 avg stays safe
-        mu_depth = cls._fuzzy_or(mu_avg, mu_max, spike_weight=0.88)
+        depth_hazard = cls._official_depth_hazard_cm(peak_cm)
+        rain_severity = cls._rainfall_severity(rain)
 
-        mu_after_trend = cls._apply_trend(mu_depth, trend_l)
-        mu_after_rain = cls._apply_rainfall(mu_after_trend, rain)
+        mu_depth = cls._memberships_from_depth_hazard(depth_hazard, peak_cm)
+        mu_rain = cls._memberships_from_rainfall(rain, rain_severity)
+        mu_depth = cls._fuzzy_or(mu_depth, cls._memberships_from_depth_hazard(
+            cls._official_depth_hazard_cm(max_water_level), max_water_level
+        ), spike_weight=0.90)
+        mu_fused = cls._fuse_depth_and_rainfall(mu_depth, mu_rain, rain_severity)
+        mu_after_trend = cls._apply_trend(mu_fused, trend_l)
 
-        probs = cls._normalize_distribution(mu_after_rain)
-        risk_key = max(probs, key=probs.get)  # "LOW" | "MEDIUM" | "HIGH"
+        probs = cls._normalize_distribution(mu_after_trend)
+        risk_key = cls._depth_rain_to_engine_risk(depth_hazard, rain_severity, trend_l)
+        # Posterior should not undercut official combined classification
+        if cls._risk_rank(risk_key) > cls._risk_rank(max(probs, key=probs.get)):
+            risk_key = risk_key
+
         risk_level = RiskLevel[risk_key]
 
-        forced_dry_low = (
-            d_avg_m <= cls.SAFE_DEPTH_CEILING_M + 1e-9 and d_max_m <= cls.SAFE_DEPTH_CEILING_M + 1e-9
-        )
-        # Never classify HIGH/MEDIUM from depth alone at dry stage (guards bad sensors / noise)
+        forced_dry_low = peak_cm < cls.SAFE_MAX_CM - 1e-9 and avg_water_level < cls.SAFE_MAX_CM - 1e-9
         if forced_dry_low:
             risk_key = "LOW"
             risk_level = RiskLevel.LOW
+            depth_hazard = "SAFE"
             probs = cls._normalize_distribution(
-                {"LOW": probs["LOW"] + probs["MEDIUM"] + probs["HIGH"], "MEDIUM": 0.0, "HIGH": 0.0}
+                {"LOW": 0.92, "MEDIUM": 0.05, "HIGH": 0.02, "CRITICAL": 0.01}
             )
 
-        confidence = cls._confidence_from_distribution(probs, trend_l, rain, d_avg_m, d_max_m)
+        confidence = cls._confidence_from_distribution(
+            probs, trend_l, rain, d_avg_m, d_max_m, depth_hazard, rain_severity
+        )
         if forced_dry_low:
             confidence = max(confidence, 0.82)
 
-        hazard_descriptor = cls._hazard_descriptor(risk_key, d_avg_m, d_max_m)
+        hazard_descriptor = cls._hazard_descriptor(depth_hazard, risk_key)
         reasoning_steps = cls._build_reasoning_steps(
+            avg_water_level,
+            max_water_level,
             d_avg_m,
             d_max_m,
+            peak_cm,
+            depth_hazard,
+            rain_severity,
             trend_l,
             rain,
-            mu_depth,
+            mu_fused,
             probs,
             risk_key,
             hazard_descriptor,
@@ -124,23 +140,25 @@ class FuzzyLogicService:
             risk_key,
             confidence,
             hazard_descriptor,
+            depth_hazard,
+            rain_severity,
             probs,
         )
 
         logger.info(
-            "Risk assessment: level=%s conf=%.2f trend=%s rain=%.1fmm depth_avg_m=%.3f",
+            "Risk assessment: level=%s depth_hazard=%s rain=%s conf=%.2f peak_cm=%.1f",
             risk_key,
+            depth_hazard,
+            rain_severity,
             confidence,
-            trend_l,
-            rain,
-            d_avg_m,
+            peak_cm,
         )
 
         return {
             "risk_level": risk_level,
             "confidence_score": confidence,
             "explanation": explanation,
-            "membership_scores": {k: round(v, 4) for k, v in probs.items()},
+            "membership_scores": {k: round(probs.get(k, 0.0), 4) for k in cls._RISK_ORDER},
             "avg_water_level": avg_water_level,
             "max_water_level": max_water_level,
             "trend": trend_l,
@@ -148,15 +166,23 @@ class FuzzyLogicService:
             "depth_avg_m": round(d_avg_m, 4),
             "depth_max_m": round(d_max_m, 4),
             "hazard_descriptor": hazard_descriptor,
+            "depth_hazard_band": depth_hazard,
+            "rainfall_severity": rain_severity,
             "reasoning_steps": reasoning_steps,
             "engineering_context": {
                 "design_rainfall_mm": cls.DESIGN_RAINFALL_MM,
                 "return_period_years": cls.RETURN_PERIOD_YEARS,
                 "annual_exceedance_probability": cls.ANNUAL_EXCEEDANCE_PROBABILITY,
-                "hazard_bands_m": {
-                    "low_yellow": [cls.HAZARD_LOW_MIN_M, cls.HAZARD_LOW_MAX_M],
-                    "medium_orange": [cls.HAZARD_MED_MIN_M, cls.HAZARD_MED_MAX_M],
-                    "high_red_above_m": cls.HAZARD_HIGH_ABOVE_M,
+                "hazard_bands_cm": {
+                    "safe_below_cm": cls.SAFE_MAX_CM,
+                    "low_yellow_cm": [cls.LOW_MIN_CM, cls.LOW_MAX_CM],
+                    "medium_orange_cm": [cls.MED_MIN_CM, cls.MED_MAX_CM],
+                    "high_red_above_cm": cls.HIGH_ABOVE_CM,
+                },
+                "rainfall_bands_mm": {
+                    "low": [0, cls.RAIN_LOW_MAX_MM],
+                    "moderate": [cls.RAIN_LOW_MAX_MM + 1, cls.RAIN_MODERATE_MAX_MM],
+                    "severe_above_mm": cls.RAIN_MODERATE_MAX_MM,
                 },
             },
         }
@@ -166,46 +192,121 @@ class FuzzyLogicService:
         return cm / 100.0
 
     @classmethod
-    def _mu_low_depth(cls, x: float) -> float:
-        """High when depth is small; tapers through low-hazard yellow band."""
-        if x < 0.0:
-            return 0.0
-        if x <= cls.SAFE_DEPTH_CEILING_M:
-            return 1.0
-        if x <= cls.HAZARD_LOW_MAX_M:
-            # gentle decay across official LOW hazard band
-            return max(0.0, 1.0 - (x - cls.SAFE_DEPTH_CEILING_M) / (cls.HAZARD_LOW_MAX_M - cls.SAFE_DEPTH_CEILING_M) * 0.35)
-        if x <= 0.62:
-            return max(0.0, 0.65 - (x - cls.HAZARD_LOW_MAX_M) / (0.62 - cls.HAZARD_LOW_MAX_M) * 0.65)
-        return 0.0
+    def _official_depth_hazard_cm(cls, peak_cm: float) -> str:
+        """Crisp official flood hazard from peak depth (cm)."""
+        if peak_cm < cls.SAFE_MAX_CM:
+            return "SAFE"
+        if peak_cm <= cls.LOW_MAX_CM:
+            return "LOW"
+        if peak_cm <= cls.MED_MAX_CM:
+            return "MEDIUM"
+        return "HIGH"
 
     @classmethod
-    def _mu_medium_depth(cls, x: float) -> float:
-        if x <= 0.35:
-            return 0.0
-        if x <= cls.HAZARD_MED_MIN_M:
-            return (x - 0.35) / (cls.HAZARD_MED_MIN_M - 0.35)
-        if x <= 1.20:
-            return 1.0
-        if x <= 1.62:
-            return max(0.0, (1.62 - x) / (1.62 - 1.20))
-        return 0.0
+    def _rainfall_severity(cls, rainfall_mm: float) -> str:
+        if rainfall_mm <= cls.RAIN_LOW_MAX_MM:
+            return "LOW"
+        if rainfall_mm <= cls.RAIN_MODERATE_MAX_MM:
+            return "MODERATE"
+        return "SEVERE"
 
     @classmethod
-    def _mu_high_depth(cls, x: float) -> float:
-        if x <= 1.18:
-            return 0.0
-        if x <= cls.HAZARD_HIGH_ABOVE_M:
-            return (x - 1.18) / (cls.HAZARD_HIGH_ABOVE_M - 1.18)
-        return 1.0
+    def _risk_rank(cls, key: str) -> int:
+        try:
+            return cls._RISK_ORDER.index(key)
+        except ValueError:
+            return 0
 
     @classmethod
-    def _base_memberships_depth(cls, depth_m: float) -> Dict[str, float]:
-        return {
-            "LOW": cls._mu_low_depth(depth_m),
-            "MEDIUM": cls._mu_medium_depth(depth_m),
-            "HIGH": cls._mu_high_depth(depth_m),
-        }
+    def _bump_risk(cls, key: str, steps: int = 1) -> str:
+        idx = min(len(cls._RISK_ORDER) - 1, cls._risk_rank(key) + steps)
+        return cls._RISK_ORDER[idx]
+
+    @classmethod
+    def _depth_rain_to_engine_risk(
+        cls, depth_hazard: str, rain_severity: str, trend: str
+    ) -> str:
+        """Map official depth + rainfall + trend to engine risk class."""
+        if depth_hazard == "SAFE":
+            base = "LOW"
+        elif depth_hazard == "LOW":
+            base = "LOW"
+        elif depth_hazard == "MEDIUM":
+            base = "MEDIUM"
+        else:
+            base = "CRITICAL"
+
+        if rain_severity == "MODERATE":
+            base = cls._bump_risk(base, 1)
+        elif rain_severity == "SEVERE":
+            base = cls._bump_risk(base, 2)
+
+        if trend == "rising" and base != "CRITICAL":
+            base = cls._bump_risk(base, 1)
+        elif trend == "falling" and base != "LOW":
+            base = cls._RISK_ORDER[max(0, cls._risk_rank(base) - 1)]
+
+        return base
+
+    @classmethod
+    def _memberships_from_depth_hazard(cls, depth_hazard: str, peak_cm: float) -> Dict[str, float]:
+        """Soft memberships anchored on official depth band."""
+        soft = 2.0  # cm fuzzy shoulder at boundaries
+        mu = {"LOW": 0.0, "MEDIUM": 0.0, "HIGH": 0.0, "CRITICAL": 0.0}
+
+        if depth_hazard == "SAFE":
+            mu["LOW"] = 1.0
+        elif depth_hazard == "LOW":
+            mu["LOW"] = 1.0
+            if peak_cm > cls.LOW_MAX_CM - soft:
+                mu["MEDIUM"] = min(1.0, (peak_cm - (cls.LOW_MAX_CM - soft)) / (2 * soft))
+                mu["LOW"] = max(0.0, 1.0 - mu["MEDIUM"])
+        elif depth_hazard == "MEDIUM":
+            mu["MEDIUM"] = 1.0
+            if peak_cm < cls.MED_MIN_CM + soft:
+                mu["LOW"] = min(1.0, (cls.MED_MIN_CM + soft - peak_cm) / (2 * soft))
+                mu["MEDIUM"] = max(0.0, 1.0 - mu["LOW"])
+            if peak_cm > cls.MED_MAX_CM - soft:
+                mu["HIGH"] = min(1.0, (peak_cm - (cls.MED_MAX_CM - soft)) / (2 * soft))
+                mu["MEDIUM"] = max(0.0, mu["MEDIUM"] - mu["HIGH"] * 0.5)
+        else:
+            mu["CRITICAL"] = 1.0
+            if peak_cm < cls.HIGH_ABOVE_CM + soft:
+                mu["HIGH"] = min(1.0, (cls.HIGH_ABOVE_CM + soft - peak_cm) / (2 * soft))
+                mu["CRITICAL"] = max(0.0, 1.0 - mu["HIGH"])
+
+        return mu
+
+    @classmethod
+    def _memberships_from_rainfall(cls, rainfall_mm: float, severity: str) -> Dict[str, float]:
+        mu = {"LOW": 0.0, "MEDIUM": 0.0, "HIGH": 0.0, "CRITICAL": 0.0}
+        if severity == "LOW":
+            mu["LOW"] = 1.0
+        elif severity == "MODERATE":
+            mu["MEDIUM"] = 0.85
+            mu["HIGH"] = 0.25
+        else:
+            mu["HIGH"] = 0.75
+            mu["CRITICAL"] = 0.9
+        ratio = min(1.0, rainfall_mm / cls.DESIGN_RAINFALL_MM) if cls.DESIGN_RAINFALL_MM > 0 else 0.0
+        mu["CRITICAL"] = max(mu["CRITICAL"], ratio * 0.35)
+        return mu
+
+    @classmethod
+    def _fuse_depth_and_rainfall(
+        cls,
+        mu_depth: Dict[str, float],
+        mu_rain: Dict[str, float],
+        rain_severity: str,
+    ) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        rain_weight = 0.45 if rain_severity == "MODERATE" else (0.62 if rain_severity == "SEVERE" else 0.18)
+        for k in cls._RISK_ORDER:
+            d = mu_depth.get(k, 0.0)
+            r = mu_rain.get(k, 0.0)
+            combined = (1.0 - rain_weight) * d + rain_weight * max(d, r)
+            out[k] = min(1.0, combined)
+        return out
 
     @staticmethod
     def _fuzzy_or(
@@ -213,40 +314,35 @@ class FuzzyLogicService:
         b: Dict[str, float],
         spike_weight: float = 0.88,
     ) -> Dict[str, float]:
+        keys = ("LOW", "MEDIUM", "HIGH", "CRITICAL")
         out: Dict[str, float] = {}
-        for k in ("LOW", "MEDIUM", "HIGH"):
-            va, vb = a[k], b[k] * spike_weight
+        for k in keys:
+            va, vb = a.get(k, 0.0), b.get(k, 0.0) * spike_weight
             out[k] = 1.0 - (1.0 - min(1.0, va)) * (1.0 - min(1.0, vb))
         return out
 
     @staticmethod
     def _apply_trend(mu: Dict[str, float], trend: str) -> Dict[str, float]:
-        out = dict(mu)
+        out = {k: mu.get(k, 0.0) for k in ("LOW", "MEDIUM", "HIGH", "CRITICAL")}
         if trend == "rising":
-            out["LOW"] *= 0.92
-            out["MEDIUM"] *= 1.06
-            out["HIGH"] *= 1.18
+            out["LOW"] *= 0.88
+            out["MEDIUM"] *= 1.08
+            out["HIGH"] *= 1.14
+            out["CRITICAL"] *= 1.22
         elif trend == "falling":
-            out["LOW"] *= 1.08
-            out["MEDIUM"] *= 0.97
-            out["HIGH"] *= 0.86
-        return out
-
-    @classmethod
-    def _apply_rainfall(cls, mu: Dict[str, float], rainfall_mm: float) -> Dict[str, float]:
-        out = dict(mu)
-        ratio = min(1.5, rainfall_mm / cls.DESIGN_RAINFALL_MM) if cls.DESIGN_RAINFALL_MM > 0 else 0.0
-        out["LOW"] *= max(0.55, 1.0 - 0.12 * ratio)
-        out["MEDIUM"] *= 1.0 + 0.10 * ratio
-        out["HIGH"] *= 1.0 + 0.22 * ratio
+            out["LOW"] *= 1.10
+            out["MEDIUM"] *= 0.95
+            out["HIGH"] *= 0.88
+            out["CRITICAL"] *= 0.80
         return out
 
     @staticmethod
     def _normalize_distribution(mu: Dict[str, float]) -> Dict[str, float]:
-        s = sum(max(0.0, v) for v in mu.values())
+        keys = ("LOW", "MEDIUM", "HIGH", "CRITICAL")
+        s = sum(max(0.0, mu.get(k, 0.0)) for k in keys)
         if s <= 1e-12:
-            return {"LOW": 1.0, "MEDIUM": 0.0, "HIGH": 0.0}
-        return {k: max(0.0, v) / s for k, v in mu.items()}
+            return {"LOW": 1.0, "MEDIUM": 0.0, "HIGH": 0.0, "CRITICAL": 0.0}
+        return {k: max(0.0, mu.get(k, 0.0)) / s for k in keys}
 
     @classmethod
     def _confidence_from_distribution(
@@ -256,74 +352,82 @@ class FuzzyLogicService:
         rainfall_mm: float,
         d_avg_m: float,
         d_max_m: float,
+        depth_hazard: str,
+        rain_severity: str,
     ) -> float:
-        """Deterministic confidence from winner strength, margin, and context."""
-        ordered = sorted(probs.values(), reverse=True)
+        ordered = sorted((probs.get(k, 0.0) for k in cls._RISK_ORDER), reverse=True)
         top = ordered[0]
         second = ordered[1] if len(ordered) > 1 else 0.0
         margin = top - second
 
-        base = 0.55 * top + 0.35 * min(1.0, margin * 4.0) + 0.10
+        base = 0.52 * top + 0.38 * min(1.0, margin * 4.0) + 0.10
+        if depth_hazard in ("MEDIUM", "HIGH"):
+            base += 0.04
+        if rain_severity == "SEVERE":
+            base += 0.03
         if trend == "stable":
             base += 0.02
-        if abs(d_max_m - d_avg_m) > 0.08:
-            base -= 0.03  # uncertainty when spike diverges
-        if rainfall_mm > cls.DESIGN_RAINFALL_MM * 0.85:
+        if abs(d_max_m - d_avg_m) > 0.25:
+            base -= 0.04
+        if rainfall_mm > cls.DESIGN_RAINFALL_MM:
             base -= 0.02
         return max(0.0, min(1.0, base))
 
     @classmethod
-    def _hazard_descriptor(cls, risk_key: str, d_avg_m: float, d_max_m: float) -> str:
-        d_show = max(d_avg_m, d_max_m)
-        if risk_key == "HIGH":
-            return "HIGH HAZARD (RED)"
-        if risk_key == "MEDIUM":
+    def _hazard_descriptor(cls, depth_hazard: str, risk_key: str) -> str:
+        if risk_key == "CRITICAL" or depth_hazard == "HIGH":
+            return "HIGH HAZARD (RED) / CRITICAL"
+        if depth_hazard == "MEDIUM":
             return "MEDIUM HAZARD (ORANGE)"
-        # LOW risk_level: distinguish safe vs yellow band
-        if d_show < cls.HAZARD_LOW_MIN_M - 1e-9:
-            return "SAFE / LOW"
-        if d_show <= cls.HAZARD_LOW_MAX_M + 1e-9:
+        if depth_hazard == "LOW":
             return "LOW HAZARD (YELLOW)"
-        return "LOW (post-adjustment; depth below HIGH thresholds)"
+        return "SAFE / LOW"
 
     @classmethod
     def _build_reasoning_steps(
         cls,
+        avg_cm: float,
+        max_cm: float,
         d_avg_m: float,
         d_max_m: float,
+        peak_cm: float,
+        depth_hazard: str,
+        rain_severity: str,
         trend: str,
         rain_mm: float,
-        mu_depth: Dict[str, float],
+        mu_fused: Dict[str, float],
         probs: Dict[str, float],
         risk_key: str,
         hazard_descriptor: str,
         forced_dry_low: bool,
     ) -> List[str]:
         steps = [
-            f"Converted sensor depth: average={d_avg_m:.3f} m, recent peak={d_max_m:.3f} m.",
             (
-                f"Depth memberships after peak fusion: LOW={mu_depth['LOW']:.3f}, "
-                f"MEDIUM={mu_depth['MEDIUM']:.3f}, HIGH={mu_depth['HIGH']:.3f}."
-            ),
-            f"Trend={trend}: adjusts memberships toward worsening risk when rising, mitigating when falling.",
-            (
-                f"Rainfall intensity={rain_mm:.1f} mm vs design IDF {cls.DESIGN_RAINFALL_MM} mm "
-                f"scales hydrologic stress in a bounded, rule-based way."
+                f"Sensor depth: average={avg_cm:.1f} cm ({d_avg_m:.3f} m), "
+                f"peak={max_cm:.1f} cm ({d_max_m:.3f} m); governing peak={peak_cm:.1f} cm."
             ),
             (
-                f"Normalized posterior: LOW={probs['LOW']:.3f}, MEDIUM={probs['MEDIUM']:.3f}, "
-                f"HIGH={probs['HIGH']:.3f} → winner={risk_key}."
+                f"Official depth hazard band: {depth_hazard} "
+                f"(YELLOW 10–50 cm, ORANGE 51–150 cm, RED >150 cm)."
             ),
-            f"Public hazard label: {hazard_descriptor}.",
             (
-                f"Annual chance of exceeding a 5-year event in a year ≈ "
-                f"{int(round(cls.ANNUAL_EXCEEDANCE_PROBABILITY * 100))}% (planning context only)."
+                f"Rainfall intensity={rain_mm:.1f} mm → severity {rain_severity} "
+                f"(LOW ≤{cls.RAIN_LOW_MAX_MM:.0f}, MODERATE ≤{cls.RAIN_MODERATE_MAX_MM:.0f}, "
+                f"SEVERE >{cls.RAIN_MODERATE_MAX_MM:.0f}); IDF design={cls.DESIGN_RAINFALL_MM} mm."
             ),
+            (
+                f"Fused memberships: LOW={mu_fused.get('LOW', 0):.3f}, MEDIUM={mu_fused.get('MEDIUM', 0):.3f}, "
+                f"HIGH={mu_fused.get('HIGH', 0):.3f}, CRITICAL={mu_fused.get('CRITICAL', 0):.3f}."
+            ),
+            (
+                f"Posterior: LOW={probs.get('LOW', 0):.3f}, MEDIUM={probs.get('MEDIUM', 0):.3f}, "
+                f"HIGH={probs.get('HIGH', 0):.3f}, CRITICAL={probs.get('CRITICAL', 0):.3f} → {risk_key}."
+            ),
+            f"Public label: {hazard_descriptor}. Trend={trend} adjusts escalation.",
         ]
         if forced_dry_low:
             steps.append(
-                "Guardrail: at or below 0.10 m average and peak, classification is forced to LOW "
-                "so sensors at dry stage never emit HIGH."
+                f"Guardrail: depth below {cls.SAFE_MAX_CM:.0f} cm — classification capped at SAFE/LOW."
             )
         return steps
 
@@ -337,20 +441,20 @@ class FuzzyLogicService:
         risk_key: str,
         confidence: float,
         hazard_descriptor: str,
+        depth_hazard: str,
+        rain_severity: str,
         probs: Dict[str, float],
     ) -> str:
         conf_pct = int(round(confidence * 100))
-        parts = [
-            f"SmartFlood fuzzy assessment: {hazard_descriptor} (engine class {risk_key}).",
-            f"Water depth average {avg_cm/100:.2f} m, peak {max_cm/100:.2f} m; trend={trend}.",
-            f"Rainfall intensity input {rain_mm:.1f} mm (design reference {cls.DESIGN_RAINFALL_MM} mm).",
-            (
-                f"Posterior weights LOW/MEDIUM/HIGH = "
-                f"{probs['LOW']:.0%}/{probs['MEDIUM']:.0%}/{probs['HIGH']:.0%}; "
-                f"confidence {conf_pct}%."
-            ),
-        ]
-        return " ".join(parts)
+        return (
+            f"SmartFlood fuzzy assessment: {hazard_descriptor} (engine class {risk_key}). "
+            f"Official depth band {depth_hazard}; water average {avg_cm:.1f} cm, peak {max_cm:.1f} cm; "
+            f"trend={trend}. Rainfall {rain_mm:.1f} mm ({rain_severity} severity vs IDF "
+            f"{cls.DESIGN_RAINFALL_MM} mm). "
+            f"Posterior LOW/MEDIUM/HIGH/CRITICAL = "
+            f"{probs.get('LOW', 0):.0%}/{probs.get('MEDIUM', 0):.0%}/"
+            f"{probs.get('HIGH', 0):.0%}/{probs.get('CRITICAL', 0):.0%}; confidence {conf_pct}%."
+        )
 
 
 __all__ = ["FuzzyLogicService"]
