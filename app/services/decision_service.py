@@ -294,12 +294,18 @@ class DecisionService:
         trend = str(fuzzy_result.get("trend", "stable")).lower()
         risk_conf = float(fuzzy_result["confidence_score"])
         priority = float(ahp_result["priority_score"])
-        depth_m = float(fuzzy_result.get("depth_avg_m", 0.0))
+        depth_m = float(fuzzy_result.get("depth_max_m", 0.0) or fuzzy_result.get("depth_avg_m", 0.0))
         rain_mm = float(fuzzy_result.get("rainfall_intensity_mm", 0.0))
         design = FuzzyLogicService.DESIGN_RAINFALL_MM
         rain_ratio = rain_mm / design if design > 0 else 0.0
-        rain_heavy = rain_ratio >= 0.72
-        catastrophic_depth = depth_m >= 1.65
+        rain_severe = rain_mm > FuzzyLogicService.RAIN_MODERATE_MAX_MM
+        rain_moderate = (
+            FuzzyLogicService.RAIN_LOW_MAX_MM < rain_mm <= FuzzyLogicService.RAIN_MODERATE_MAX_MM
+        )
+        rain_heavy = rain_severe or rain_moderate
+        depth_hazard = str(fuzzy_result.get("depth_hazard_band", ""))
+        catastrophic_depth = depth_m > FuzzyLogicService.HAZARD_HIGH_ABOVE_M
+        high_hazard = risk in ("HIGH", "CRITICAL") or depth_hazard == "HIGH"
 
         high_p = priority >= cls.HIGH_PRIORITY_THRESHOLD
         med_p = priority >= cls.MEDIUM_PRIORITY_THRESHOLD
@@ -311,8 +317,8 @@ class DecisionService:
         def conf(base: float) -> float:
             return max(0.0, min(1.0, base))
 
-        # --- Full evacuation (catastrophic hydrology + demographics) ---
-        if risk == "HIGH" and rising and high_p and (catastrophic_depth or rain_heavy):
+        # --- Full evacuation (HIGH/CRITICAL hazard + demographics) ---
+        if high_hazard and rising and high_p and (catastrophic_depth or rain_severe):
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.FULL_EVACUATION,
@@ -325,7 +331,7 @@ class DecisionService:
                     conf(min(0.97, risk_conf + 0.14 * (0.5 + rain_ratio))),
                 )
             )
-        elif risk == "HIGH" and rising and med_p and catastrophic_depth:
+        elif high_hazard and rising and med_p and catastrophic_depth:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.FULL_EVACUATION,
@@ -338,20 +344,32 @@ class DecisionService:
                 )
             )
 
-        # --- Immediate relief / rescue / medical ---
-        if risk == "HIGH" and high_p:
+        # --- Immediate relief / rescue / medical (HIGH hazard → CRITICAL response) ---
+        if high_hazard and high_p:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.IMMEDIATE_RELIEF,
                     (
-                        "HIGH hazard class with high vulnerability index — life-safety relief "
-                        "(water, food, medical) must be treated as immediate"
+                        "HIGH/CRITICAL hazard with high vulnerability — immediate relief allocation "
+                        "and emergency response activation required"
                     ),
-                    100.0,
-                    conf(min(0.95, risk_conf + 0.12)),
+                    108.0 if risk == "CRITICAL" else 100.0,
+                    conf(min(0.97, risk_conf + 0.14)),
                 )
             )
-        elif risk == "MEDIUM" and high_p and (rising or rain_heavy):
+        elif high_hazard:
+            raw.append(
+                _RawSuggestion(
+                    RecommendedAction.IMMEDIATE_RELIEF,
+                    (
+                        "Official HIGH hazard (depth >150 cm) — immediate relief allocation "
+                        "and emergency logistics even with lower recorded vulnerability"
+                    ),
+                    98.0 if risk == "CRITICAL" else 94.0,
+                    conf(min(0.94, risk_conf + 0.10)),
+                )
+            )
+        elif risk == "MEDIUM" and high_p and (rising or rain_severe):
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.IMMEDIATE_RELIEF,
@@ -373,20 +391,31 @@ class DecisionService:
                 )
             )
 
-        if risk == "HIGH":
+        if high_hazard:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.DEPLOY_RESCUE_TEAM,
                     (
-                        "HIGH hazard requires rescue capacity staged or deployed; "
-                        f"trend={trend}, rainfall ratio vs design={rain_ratio:.2f}"
+                        "HIGH/CRITICAL hazard — deploy rescue teams; immediate evacuation "
+                        f"corridors may be required (trend={trend}, rain={rain_mm:.1f} mm)"
                     ),
-                    87.0,
-                    conf(risk_conf * 0.88 + (0.06 if rising else 0.0) + (0.04 if rain_heavy else 0.0)),
+                    92.0 if risk == "CRITICAL" else 87.0,
+                    conf(risk_conf * 0.90 + (0.08 if rising else 0.0) + (0.06 if rain_severe else 0.0)),
+                )
+            )
+            raw.append(
+                _RawSuggestion(
+                    RecommendedAction.FULL_EVACUATION,
+                    (
+                        "Official RED-band flood depth — recommend immediate evacuation "
+                        "coordination alongside relief staging"
+                    ),
+                    95.0 if catastrophic_depth else 88.0,
+                    conf(risk_conf * 0.86 + (0.08 if rising else 0.0)),
                 )
             )
 
-        if high_p and risk != "LOW":
+        if high_p and risk not in ("LOW",):
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.SEND_MEDICAL_ASSISTANCE,
@@ -399,17 +428,29 @@ class DecisionService:
                 )
             )
 
-        if risk in ("HIGH", "MEDIUM") and rising:
+        if high_hazard and rising:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.PARTIAL_EVACUATION,
-                    "Rising hydrograph — staged/partial evacuation reduces exposure before depth peaks",
-                    85.0 if risk == "HIGH" else 73.0,
-                    conf(risk_conf * 0.85 + 0.08 * (1.0 if rising else 0.0)),
+                    "Rising hydrograph under HIGH/CRITICAL hazard — escalate toward full evacuation",
+                    90.0 if risk == "CRITICAL" else 85.0,
+                    conf(risk_conf * 0.88 + 0.08),
+                )
+            )
+        elif risk == "MEDIUM" and rising:
+            raw.append(
+                _RawSuggestion(
+                    RecommendedAction.PARTIAL_EVACUATION,
+                    (
+                        "MEDIUM hazard (51–150 cm) with rising trend — prepare evacuation centers "
+                        "and staged movement for at-risk blocks"
+                    ),
+                    78.0,
+                    conf(risk_conf * 0.84 + 0.06),
                 )
             )
 
-        if risk == "HIGH" and med_p:
+        if high_hazard and med_p:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.PREPARE_FOOD_PACKS,
@@ -421,20 +462,33 @@ class DecisionService:
                     conf(risk_conf * 0.82 + priority * 0.1 + (0.03 if rain_heavy else 0.0)),
                 )
             )
-        elif risk == "MEDIUM" and (med_p or rain_heavy):
+        elif risk == "MEDIUM" and (med_p or rain_moderate or rain_severe):
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.PREPARE_FOOD_PACKS,
                     (
-                        "MEDIUM hazard with hydrologic or demographic stress — stage food packs for "
-                        "likely distribution within the event window"
+                        "MEDIUM hazard (ORANGE band) — preposition relief goods and food packs "
+                        "for evacuation centers"
                     ),
-                    58.0,
-                    conf(0.55 * risk_conf + 0.25 * priority + (0.15 if rain_heavy else 0.0)),
+                    62.0,
+                    conf(0.58 * risk_conf + 0.25 * priority + (0.12 if rain_heavy else 0.0)),
                 )
             )
 
-        if risk in ("HIGH", "MEDIUM") and (rising or (risk == "HIGH" and stable) or rain_heavy):
+        if risk == "MEDIUM":
+            raw.append(
+                _RawSuggestion(
+                    RecommendedAction.PREPARE_ADDITIONAL_RESOURCES,
+                    (
+                        "MEDIUM hazard — prepare evacuation centers and preposition relief goods "
+                        f"(rainfall {rain_mm:.1f} mm, severity context vs IDF {design:.1f} mm)"
+                    ),
+                    68.0,
+                    conf(risk_conf * 0.80 + (0.06 if rain_moderate else 0.0)),
+                )
+            )
+
+        if high_hazard or (risk == "MEDIUM" and (rising or rain_heavy)):
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.PREPARE_ADDITIONAL_RESOURCES,
@@ -452,11 +506,11 @@ class DecisionService:
                 _RawSuggestion(
                     RecommendedAction.PREPARE,
                     (
-                        "MEDIUM hazard with moderate vulnerability — verify routes, shelters, "
-                        "and roster vulnerable households before stronger actions"
+                        "MEDIUM hazard (51–150 cm) — prepare evacuation centers and response teams; "
+                        "verify routes and vulnerable household roster"
                     ),
-                    56.0,
-                    conf((risk_conf + priority) / 2 * 0.88),
+                    60.0,
+                    conf((risk_conf + priority) / 2 * 0.90),
                 )
             )
 
@@ -473,26 +527,39 @@ class DecisionService:
                 )
             )
 
+        if risk == "LOW" and depth_hazard == "LOW":
+            raw.append(
+                _RawSuggestion(
+                    RecommendedAction.PREPARE,
+                    (
+                        "LOW hazard (YELLOW band, 10–50 cm) — prepare response teams and "
+                        "preposition basic relief assets"
+                    ),
+                    52.0,
+                    conf(risk_conf * 0.82 + priority * 0.08),
+                )
+            )
+
         if risk == "LOW" and high_p:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.PREPARE,
                     (
-                        "Hydrology in SAFE/LOW band but registry shows concentrated vulnerability — "
-                        "keep contingency kits and transport on standby"
+                        "LOW/SAFE hydrology but concentrated vulnerability — prepare response teams "
+                        "and keep transport on standby"
                     ),
-                    44.0,
-                    conf(risk_conf * 0.75 + priority * 0.15),
+                    48.0,
+                    conf(risk_conf * 0.78 + priority * 0.15),
                 )
             )
 
-        if risk == "LOW" and not high_p:
+        if risk == "LOW" and depth_hazard in ("SAFE", "") and not high_p:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.SAFE,
                     (
-                        "SAFE/LOW hazard with limited vulnerability signals — routine readiness only; "
-                        "human confirmation still required before standing down"
+                        "Depth below 10 cm advisory threshold — monitor conditions; "
+                        "routine readiness only"
                     ),
                     36.0,
                     conf(risk_conf * 0.88),
@@ -501,22 +568,21 @@ class DecisionService:
             raw.append(
                 _RawSuggestion(
                     RecommendedAction.MONITOR,
-                    "Maintain routine monitoring; hydrology can change quickly under new rainfall",
-                    31.0,
-                    conf(0.55 + (0.05 if falling else 0.0)),
+                    "SAFE status — maintain sensor and field monitoring under changing rainfall",
+                    34.0,
+                    conf(0.58 + (0.05 if falling else 0.0)),
                 )
             )
-
-        if risk == "HIGH" and not high_p and not med_p:
+        elif risk == "LOW" and not high_p:
             raw.append(
                 _RawSuggestion(
-                    RecommendedAction.PREPARE,
+                    RecommendedAction.MONITOR,
                     (
-                        "HIGH water class with lower recorded demographic vulnerability — "
-                        "still pre-position assets; depth alone justifies operational readiness"
+                        "LOW hazard band with limited vulnerability — monitor conditions; "
+                        "prepare response teams if rainfall intensifies"
                     ),
-                    63.0,
-                    conf(risk_conf * 0.84 + (0.04 if rain_heavy else 0.0)),
+                    40.0,
+                    conf(risk_conf * 0.80),
                 )
             )
 
