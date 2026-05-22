@@ -157,7 +157,7 @@ class ExplainabilityPayload(BaseModel):
 class RecommendedItem(BaseModel):
     """Specific relief item recommendation."""
     item: str = Field(..., description="Name of the recommended item")
-    quantity: str = Field(..., description="Quantity of the item (can be int or string with units)")
+    quantity: str | int = Field(..., description="Quantity of the item (can be int or string with units)")
     reason: str = Field(..., description="Operational reason for recommending this item")
 
 
@@ -276,11 +276,22 @@ class CityWideAnalysisItem(BaseModel):
     """
     barangay_id: int
     barangay_name: str
-    risk_level: RiskLevel
-    confidence_score: float
-    recommended_items: List[str]
-    short_reason: str
-    detailed_reasoning: CityWideDetailedReasoning
+    priority_level: str
+    analysis_confidence: int
+    operational_urgency_score: int
+    recommendation_status: RecommendationStatus
+
+    affected_population: int
+    affected_families: int
+
+    recommended_items: List[RecommendedItem]
+    analysis_reason: List[str]
+
+    inventory_constraints: List[InventoryConstraint]
+    sensor_reliability: Optional[SensorReliability] = None
+
+    operational_notes: List[str]
+    recommendation_source: List[str]
 
 
 class CityWideAnalysisResponse(BaseModel):

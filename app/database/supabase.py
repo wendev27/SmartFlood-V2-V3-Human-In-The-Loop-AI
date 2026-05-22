@@ -153,11 +153,10 @@ class SupabaseConnection:
         client = cls.get_client()
         
         try:
-            # Try fetching from a 'barangays' table
             try:
-                response = client.table("barangays").select("id, name").execute()
+                response = client.table("barangays").select("barangay_id, name").execute()
                 if response.data:
-                    return response.data
+                    return [{"id": r["barangay_id"], "name": r["name"]} for r in response.data]
             except Exception as inner_e:
                 logger.warning(f"Could not fetch from 'barangays' table, falling back to residents: {inner_e}")
 
