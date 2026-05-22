@@ -4,7 +4,7 @@ Evolves the AI into an Operational Disaster Logistics Intelligence Engine.
 Handles deterministic resource estimation, multi-factor priority, and sensor reliability checks.
 """
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 import logging
 from app.config.operational_constants import (
     AVERAGE_HOUSEHOLD_SIZE,
