@@ -804,54 +804,59 @@ class DecisionService:
                 decision = cls.make_decision(barangay_id=bg_id_int)
                 
                 # Format into CityWideAnalysisItem dict
-                explain = decision.get("explainability", {}) or {}
-                
-                # Map risk level string/enum to RiskLevel enum values
-                raw_risk = decision.get("risk_level", RiskLevel.MEDIUM)
-                risk_str = raw_risk.value if hasattr(raw_risk, "value") else str(raw_risk)
+                from app.models.schemas import RecommendationStatus
                 
                 item = {
                     "barangay_id": bg_id_int,
                     "barangay_name": bg.get("name", f"Barangay {bg_id_int}"),
-                    "risk_level": risk_str,
-                    "confidence_score": decision.get("confidence_score", 0.0),
-                    "recommended_items": [s.get("action").value if hasattr(s.get("action"), "value") else str(s.get("action")) for s in decision.get("suggestions", [])],
-                    "short_reason": decision.get("explanation", ""),
-                    "detailed_reasoning": {
-                        "flood_analysis": explain.get("why_flood_risk_classified", ""),
-                        "vulnerability_analysis": explain.get("why_barangay_priority", ""),
-                        "contributing_factors": decision.get("_metadata", {}).get("vulnerability_factors", []),
-                        "recommendation_reasoning": explain.get("top_recommendations_explained", []),
-                        "ahp_breakdown": decision.get("ahp_breakdown"),
-                        "fuzzy_assessment": decision.get("fuzzy_assessment")
-                    },
-                    # We also temporarily store priority_score for sorting
-                    "_priority_score": decision.get("priority_score", 0.0)
+                    "priority_level": decision.get("priority_level", "MEDIUM"),
+                    "analysis_confidence": int(decision.get("analysis_confidence", 0)),
+                    "operational_urgency_score": int(decision.get("operational_urgency_score", 0)),
+                    "recommendation_status": decision.get("recommendation_status", RecommendationStatus.MONITORING),
+
+                    "affected_population": int(decision.get("affected_population", 0)),
+                    "affected_families": int(decision.get("affected_families", 0)),
+
+                    "recommended_items": decision.get("recommended_items", []),
+                    "analysis_reason": decision.get("analysis_reason", []),
+
+                    "inventory_constraints": decision.get("inventory_constraints", []),
+                    "sensor_reliability": decision.get("sensor_reliability"),
+
+                    "operational_notes": decision.get("operational_notes", []),
+                    "recommendation_source": decision.get("recommendation_source", []),
+                    # We temporarily store priority_score and risk_level for sorting
+                    "_priority_score": decision.get("priority_score", 0.0),
+                    "_risk_level": decision.get("risk_level", RiskLevel.MEDIUM)
                 }
                 analysis_results.append(item)
             except Exception as e:
                 logger.error(f"Error processing barangay {bg_id} for city-wide analysis: {e}")
                 
-        # Sort by: HIGH risk first, then confidence score, then vulnerability (priority_score)
+        # Sort by: HIGH/CRITICAL risk first, then confidence score, then vulnerability (priority_score)
         def sort_key(item):
-            risk = item["risk_level"]
-            if risk == "HIGH":
+            risk = item["_risk_level"]
+            risk_str = risk.value if hasattr(risk, "value") else str(risk)
+            if risk_str == "CRITICAL":
+                risk_val = 4
+            elif risk_str == "HIGH":
                 risk_val = 3
-            elif risk == "MEDIUM":
+            elif risk_str == "MEDIUM":
                 risk_val = 2
             else:
                 risk_val = 1
                 
             return (
                 risk_val,
-                item["confidence_score"],
+                item["analysis_confidence"],
                 item["_priority_score"]
             )
             
         analysis_results.sort(key=sort_key, reverse=True)
         
-        # Remove the temporary sort key
+        # Remove temporary sorting fields
         for item in analysis_results:
             item.pop("_priority_score", None)
+            item.pop("_risk_level", None)
             
         return analysis_results
